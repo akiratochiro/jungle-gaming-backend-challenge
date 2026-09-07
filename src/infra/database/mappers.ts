@@ -77,6 +77,8 @@ export const WagerTxMapper = {
       referenceTransactionId: e.referenceTransactionId,
       failureCode: e.failureCode,
       processedAt: e.processedAt,
+      referenceResolutionAttempts: e.referenceAttempts,
+      nextReferenceAttemptAt: e.nextAttemptAt,
     });
   },
   apply(
@@ -102,6 +104,8 @@ export const WagerTxMapper = {
     e.referenceTransactionId = t.referenceTransactionId;
     e.failureCode = t.failureCode;
     e.processedAt = t.processedAt;
+    e.referenceAttempts = t.referenceResolutionAttempts;
+    e.nextAttemptAt = t.nextReferenceAttemptAt;
     e.balanceChanged = t.affectsBalance() && t.status === 'PROCESSED';
     if (resultBalanceAmount !== undefined) e.resultBalanceAmount = resultBalanceAmount;
     e.createdAt = t.createdAt;

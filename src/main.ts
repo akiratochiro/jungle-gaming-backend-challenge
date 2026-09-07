@@ -4,6 +4,7 @@ import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { DomainExceptionFilter } from './http/domain-exception.filter';
 import { OutboxRelay } from './infra/outbox/outbox-relay';
+import { PendingReferenceWorker } from './infra/workers/pending-reference.worker';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bufferLogs: false });
@@ -19,9 +20,13 @@ async function bootstrap() {
   app.useGlobalFilters(new DomainExceptionFilter());
   app.enableShutdownHooks();
 
-  // Run the outbox relay in-process (it is also safe to run as a dedicated worker).
+  // Background workers run in-process by default; each is also safe standalone
+  // and safe to run on multiple instances.
   if (process.env.OUTBOX_RELAY_ENABLED !== 'false') {
     app.get(OutboxRelay).start();
+  }
+  if (process.env.PENDING_REFERENCE_WORKER_ENABLED !== 'false') {
+    app.get(PendingReferenceWorker).start();
   }
 
   const port = Number(process.env.PORT ?? 3000);

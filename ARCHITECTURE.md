@@ -1,11 +1,12 @@
 # Architecture & Decisions
 
-> Status: **MVP vertical slice**. Implemented end‑to‑end: wallet creation
-> (`OPENING`), `BET` / `WIN` / `LOSS` over HTTP, pessimistic hot‑wallet
+> Status. Implemented end‑to‑end: wallet creation (`OPENING`), `BET` / `WIN` /
+> `LOSS`, `REFUND` / `ROLLBACK` (with reference resolution), the
+> `PENDING_REFERENCE` worker (out‑of‑order references), pessimistic hot‑wallet
 > concurrency, persistent idempotency, transactional outbox + relay, ledger,
-> reconciliation, health checks. **Not yet implemented** (documented design
-> below, extension points in place): SQS consumer wiring, `REFUND` / `ROLLBACK`,
-> the `PENDING_REFERENCE` worker, DLQ handling, metrics. See *Roadmap*.
+> reconciliation, health checks. **Not yet wired** (documented design below,
+> extension points in place): SQS consumer, DLQ handling, metrics/JSON logs.
+> See *Roadmap*.
 
 ---
 
@@ -143,12 +144,54 @@ as the wallet/ledger/wager writes. Events are never published before commit.
 - Send failure → exponential backoff via `attempts` / `next_attempt_at`.
 
 Events implemented: `WagerTransactionProcessed` (incl. `LOSS`),
-`WagerTransactionRejected`, `WalletBalanceChanged` (only when the balance moved).
-`WagerTransactionPendingReference` is defined, emitted once §7.1 lands.
+`WagerTransactionRejected`, `WalletBalanceChanged` (only when the balance moved),
+`WagerTransactionPendingReference` (reference missing). A mere worker reschedule
+emits nothing; only a state change does.
 
 Envelope: `IntegrationEvent<T>` is an **abstract class**; `eventType` and
 `version` live on the concrete subclass, not at the call site. `data` always
 carries `MoneyProps` (decimal strings), never a `Money` instance.
+
+## 6b. Reversals — `REFUND` / `ROLLBACK`
+
+Rules live in one place, `domain/wager/reversal.ts` (`validateReversal`) +
+`application/wager/apply-reversal.service.ts`, shared by the synchronous submit
+path and the pending‑reference worker.
+
+- **Reference resolution**: by `(providerId, referenceExternalTransactionId)` —
+  the provider's id, never the internal one. The resolved reference must be
+  `PROCESSED` and share **provider, player, wallet, currency and round**.
+- `REFUND` targets only `BET`; `ROLLBACK` targets `BET`, `WIN` or `REFUND`
+  (`REFERENCE_KIND_NOT_ALLOWED` otherwise).
+- **Amount must equal the reference** — partial reversal is out of scope
+  (`REVERSAL_AMOUNT_MISMATCH`).
+- **Direction**: `REFUND` always credits; `ROLLBACK` inverts the reference's
+  ledger direction (`WagerTransaction.ledgerDirectionFor(reference)`).
+- **Reverse once per kind** (rule 7.4): checked in‑app *and* enforced by the
+  partial unique index `(reference_transaction_id, kind) WHERE status='PROCESSED'
+  AND kind IN ('REFUND','ROLLBACK')`. A second attempt →
+  `REFERENCE_ALREADY_REVERSED`. All reversals of a reference touch the same
+  wallet, so the wallet lock serialises them; the index is the race backstop.
+  *Known edge, documented:* a `BET` may be both `REFUND`ed and `ROLLBACK`ed
+  (different kinds) — the rule is "twice by the same kind".
+- **Overdraw**: a `ROLLBACK` debit that would push the balance negative →
+  `REVERSAL_WOULD_OVERDRAW`, **distinct** from `INSUFFICIENT_FUNDS` (rule 7.9),
+  persisted and auditable.
+
+### Pending reference (out‑of‑order, §7.1)
+
+If the reference is not found, the transaction is persisted as
+`PENDING_REFERENCE` (HTTP `202`) with `WagerTransactionPendingReference` emitted.
+`PendingReferenceWorker` scans
+`status='PENDING_REFERENCE' AND next_attempt_at <= now()` (partial index),
+`LIMIT n`, and re‑runs `ResolvePendingReferenceUseCase` per row **under the
+wallet lock** — a stale pick is a no‑op, so it is multi‑instance safe.
+
+`ReferenceResolutionPolicy`: first retry immediate, then exponential backoff from
+`baseDelayMs` (2s) capped at `capDelayMs` (5min), up to `maxAttempts` (10).
+Budget exhausted → `REJECTED / REFERENCE_NOT_FOUND` + `WagerTransactionRejected`.
+Rationale: ~10 attempts over roughly 40 min tolerates realistic out‑of‑order
+windows without parking rows forever.
 
 ## 7. HTTP status mapping
 
@@ -198,10 +241,12 @@ outbox lag).
 
 - **Unit** (`bun test src`, no I/O): `Money` scale/rounding/invalid input;
   `Wallet` invariants; `WagerTransaction` transitions + `ledgerDirectionFor`;
-  currency conflict; idempotency‑key/payload divergence.
+  `validateReversal` rules; currency conflict; idempotency‑key/payload divergence.
 - **Integration** (`test/integration`, real PostgreSQL + real LocalStack SQS):
   outbox atomicity, relay publish‑once, crash‑pending rows, rejection emits no
-  ledger entry.
+  ledger entry; `REFUND`/`ROLLBACK` happy paths, reverse‑once rejection,
+  amount‑mismatch, overdraw, and out‑of‑order `PENDING_REFERENCE` → worker
+  resolves / exhausts the budget.
 - **Concurrency** (`test/concurrency`, real parallelism via `Promise.all`
   against a live HTTP server): the §8 scenario, 50× duplicate, idempotency
   conflict.
@@ -212,16 +257,13 @@ outbox lag).
 ## 12. Roadmap (next slices)
 
 1. **SQS consumer**: `@aws-sdk/client-sqs` long‑poll loop → `claimInbox`
-   (`inbox_messages` PK `(consumer_name, message_id)`) → **same
-   `SubmitWagerTransactionUseCase`** → ack only after commit; business error →
-   ack, transient → visibility timeout, permanent → DLQ after `maxReceiveCount`.
-2. **`REFUND` / `ROLLBACK`**: reference resolution by
-   `(providerId, referenceExternalTransactionId)`, same
-   provider/player/wallet/currency/round check, amount‑equality check, the
-   partial unique index already blocks double reversal.
-3. **`PENDING_REFERENCE` worker**: scheduled scan
-   (`WHERE status='PENDING_REFERENCE' AND next_attempt_at <= now()`),
-   exponential backoff, TTL → `REJECTED / REFERENCE_NOT_FOUND` + event.
-4. **Metrics + JSON logs**, load test (`bun run test:load`).
-5. Multi‑instance test harness (spawn 3 `bun run src/main.ts` on different
+   (`inbox_messages` PK `(consumer_name, message_id)`, already implemented in the
+   UoW) → **same `SubmitWagerTransactionUseCase`** (it already accepts a
+   `cmd.inbox`) → ack only after commit; business error → ack, transient →
+   visibility timeout, permanent → DLQ after `maxReceiveCount`.
+2. **Metrics + JSON logs**: Prometheus counters (transactions by status,
+   duplicates, retries, DLQ depth, lock waits, outbox lag), a global JSON log
+   formatter.
+3. **Load test** exposed as `bun run test:load`.
+4. Multi‑instance test harness (spawn 3 `bun run src/main.ts` on different
    ports against one DB) — correctness already holds because the lock is in PG.

@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { EntityManager } from '@mikro-orm/postgresql';
 import { LockMode } from '@mikro-orm/core';
+import { WagerTransactionStatus } from '../../domain/wager/enums';
 import { uuidv7 } from 'uuidv7';
 import { IntegrationEvent } from '../../domain/events/integration-event';
 import { WagerTransaction } from '../../domain/wager/wager-transaction';
@@ -49,10 +50,24 @@ export class MikroWagerUnitOfWork extends WagerUnitOfWork {
           };
         },
 
+        async findById(transactionId) {
+          const row = await em.findOne(WagerTransactionEntity, { id: transactionId });
+          return row ? WagerTxMapper.toDomain(row) : null;
+        },
+
         async findByProviderRef(providerId, externalTransactionId) {
           const row = await em.findOne(WagerTransactionEntity, {
             providerId,
             externalTransactionId,
+          });
+          return row ? WagerTxMapper.toDomain(row) : null;
+        },
+
+        async findReversal(referenceTransactionId, kind) {
+          const row = await em.findOne(WagerTransactionEntity, {
+            referenceTransactionId,
+            kind,
+            status: WagerTransactionStatus.Processed,
           });
           return row ? WagerTxMapper.toDomain(row) : null;
         },

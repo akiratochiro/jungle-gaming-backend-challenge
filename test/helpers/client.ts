@@ -38,14 +38,17 @@ export class Client {
   }
 }
 
-export const bet = (over: Record<string, unknown> = {}) => ({
+export const op = (kind: string, over: Record<string, unknown> = {}) => ({
   providerId: 'provider-a',
   externalTransactionId: uuidv7(),
   playerId: over.playerId ?? uuidv7(),
   walletId: over.walletId,
   roundId: 'round-1',
   gameId: 'fortune-chimp',
-  kind: 'BET',
+  kind,
   money: { amount: '80.00', currency: 'BRL' },
   ...over,
 });
+
+export const bet = (over: Record<string, unknown> = {}) => op('BET', over);
+

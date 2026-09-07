@@ -32,6 +32,8 @@ export interface WagerTransactionState extends Omit<CreateWagerTransactionProps,
   referenceTransactionId?: string;
   failureCode?: FailureCode;
   processedAt?: Date;
+  referenceResolutionAttempts?: number;
+  nextReferenceAttemptAt?: Date;
 }
 
 const KINDS_REQUIRING_REFERENCE: ReadonlySet<WagerTransactionKind> = new Set([
@@ -65,6 +67,8 @@ export class WagerTransaction {
     private _referenceTransactionId?: string,
     private _failureCode?: FailureCode,
     private _processedAt?: Date,
+    private _referenceResolutionAttempts: number = 0,
+    private _nextReferenceAttemptAt?: Date,
   ) {}
 
   /** Born in PENDING. Validates the per-kind reference requirement. */
@@ -110,6 +114,8 @@ export class WagerTransaction {
       state.referenceTransactionId,
       state.failureCode,
       state.processedAt,
+      state.referenceResolutionAttempts ?? 0,
+      state.nextReferenceAttemptAt,
     );
   }
 
@@ -124,6 +130,12 @@ export class WagerTransaction {
   }
   get processedAt(): Date | undefined {
     return this._processedAt;
+  }
+  get referenceResolutionAttempts(): number {
+    return this._referenceResolutionAttempts;
+  }
+  get nextReferenceAttemptAt(): Date | undefined {
+    return this._nextReferenceAttemptAt;
   }
 
   // ---- transitions -------------------------------------------------------
@@ -141,9 +153,20 @@ export class WagerTransaction {
     this._processedAt = at;
   }
 
-  markPendingReference(): void {
+  /**
+   * Park the transaction until its referenced transaction shows up. Each call
+   * counts as one resolution attempt and schedules the next retry.
+   */
+  markPendingReference(nextAttemptAt: Date): void {
     this.assertNotTerminal(WagerTransactionStatus.PendingReference);
     this._status = WagerTransactionStatus.PendingReference;
+    this._referenceResolutionAttempts += 1;
+    this._nextReferenceAttemptAt = nextAttemptAt;
+  }
+
+  /** true once the reference has been chased `maxAttempts` times without luck. */
+  hasExhaustedReferenceResolution(maxAttempts: number): boolean {
+    return this._referenceResolutionAttempts >= maxAttempts;
   }
 
   reject(code: FailureCode): void {

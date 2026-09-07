@@ -54,8 +54,9 @@ describe('WagerTransaction transitions', () => {
 
   it('PENDING -> PENDING_REFERENCE -> PROCESSED is allowed', () => {
     const tx = make({ kind: WagerTransactionKind.Refund, referenceExternalTransactionId: 'ext-0' });
-    tx.markPendingReference();
+    tx.markPendingReference(new Date());
     expect(tx.status).toBe(WagerTransactionStatus.PendingReference);
+    expect(tx.referenceResolutionAttempts).toBe(1);
     tx.markProcessed('ref-tx', new Date());
     expect(tx.status).toBe(WagerTransactionStatus.Processed);
   });

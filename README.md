@@ -7,11 +7,11 @@ transactional outbox.
 
 Design decisions, trade‑offs and current scope live in **[ARCHITECTURE.md](./ARCHITECTURE.md)**.
 
-> **Scope note:** this is an MVP vertical slice — wallet creation, `BET` / `WIN` /
-> `LOSS` over HTTP, hot‑wallet concurrency, idempotency, outbox + relay, ledger,
-> reconciliation, health checks. SQS consumer, `REFUND`/`ROLLBACK` and the
-> pending‑reference worker are designed and stubbed (see ARCHITECTURE.md
-> §Roadmap) but not yet wired.
+> **Scope note:** implemented — wallet creation, `BET` / `WIN` / `LOSS`,
+> `REFUND` / `ROLLBACK` with reference resolution, the pending‑reference worker
+> (out‑of‑order), hot‑wallet concurrency, idempotency, outbox + relay, ledger,
+> reconciliation, health checks. Not yet wired: the SQS consumer, DLQ handling,
+> metrics/JSON logs (see [ARCHITECTURE.md](./ARCHITECTURE.md) §Roadmap).
 
 ---
 

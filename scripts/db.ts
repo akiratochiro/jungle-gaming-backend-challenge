@@ -25,7 +25,7 @@ try {
       break;
     case 'fresh': {
       const gen = orm.getSchemaGenerator();
-      await gen.dropSchema();
+      await gen.dropSchema({ dropMigrationsTable: true });
       await migrator.up();
       console.log('schema dropped and migrations re-applied');
       break;

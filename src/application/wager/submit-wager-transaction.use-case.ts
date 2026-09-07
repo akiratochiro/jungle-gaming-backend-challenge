@@ -1,15 +1,13 @@
 import { Injectable } from '@nestjs/common';
 import { Money, MoneyProps } from '../../domain/shared/money';
 import { WalletLedgerEntry } from '../../domain/wallet/wallet-ledger-entry';
-import {
-  WagerTransactionKind,
-  WagerTransactionStatus,
-} from '../../domain/wager/enums';
+import { WagerTransactionKind, WagerTransactionStatus } from '../../domain/wager/enums';
 import { FailureCode } from '../../domain/wager/failure-code';
 import { WagerTransaction } from '../../domain/wager/wager-transaction';
 import { IdempotencyConflictError } from '../../domain/wager/errors';
 import { IntegrationEvent } from '../../domain/events/integration-event';
 import {
+  WagerTransactionPendingReference,
   WagerTransactionProcessed,
   WagerTransactionRejected,
   WalletBalanceChanged,
@@ -18,6 +16,8 @@ import { IdGenerator } from '../ports/id-generator';
 import { WagerTxContext, WagerUnitOfWork } from '../ports/wager-unit-of-work';
 import { WagerBusinessPayload, computePayloadHash } from './wager-payload';
 import { ValidationError, WalletNotFoundError } from './errors';
+import { ApplyReversalService } from './apply-reversal.service';
+import { ReferenceResolutionPolicy } from './reference-resolution-policy';
 
 export interface SubmitWagerCommand {
   idempotencyKey: string;
@@ -44,18 +44,18 @@ const SUBMITTABLE_KINDS: ReadonlySet<WagerTransactionKind> = new Set([
   WagerTransactionKind.Rollback,
 ]);
 
-/** MVP slice: BET / WIN / LOSS applied synchronously. */
-const SUPPORTED_KINDS: ReadonlySet<WagerTransactionKind> = new Set([
-  WagerTransactionKind.Bet,
-  WagerTransactionKind.Win,
-  WagerTransactionKind.Loss,
-]);
+type InMemoryOutcome =
+  | { kind: 'processed'; entry?: WalletLedgerEntry }
+  | { kind: 'rejected' }
+  | { kind: 'pending-reference' };
 
 @Injectable()
 export class SubmitWagerTransactionUseCase {
   constructor(
     private readonly uow: WagerUnitOfWork,
     private readonly ids: IdGenerator,
+    private readonly reversals: ApplyReversalService,
+    private readonly referencePolicy: ReferenceResolutionPolicy,
   ) {}
 
   async execute(cmd: SubmitWagerCommand): Promise<SubmitWagerResult> {
@@ -64,8 +64,12 @@ export class SubmitWagerTransactionUseCase {
     if (!SUBMITTABLE_KINDS.has(payload.kind)) {
       throw new ValidationError(`Kind ${payload.kind} cannot be submitted`);
     }
-    if (!SUPPORTED_KINDS.has(payload.kind)) {
-      throw new ValidationError(`Kind ${payload.kind} is not supported yet in this build`);
+    if (
+      (payload.kind === WagerTransactionKind.Refund ||
+        payload.kind === WagerTransactionKind.Rollback) &&
+      !payload.referenceExternalTransactionId
+    ) {
+      throw new ValidationError(`${payload.kind} requires referenceExternalTransactionId`);
     }
 
     // Entry-contract validation of the monetary amount.
@@ -91,21 +95,18 @@ export class SubmitWagerTransactionUseCase {
       if (!fresh) {
         const replay = await this.replayByKey(ctx, cmd.idempotencyKey, payloadHash);
         if (replay) return replay;
-        // Row existed but original not yet visible — treat as transient.
         throw new Error('Inbox row present but original outcome not found; retry');
       }
     }
 
-    // ---- persistent idempotency --------------------------------------------
+    // ---- persistent idempotency ----------------------------------------
     const replay = await this.replayByKey(ctx, cmd.idempotencyKey, payloadHash);
     if (replay) {
-      if (cmd.inbox && ctx.markInboxProcessed) {
-        await ctx.markInboxProcessed(cmd.inbox.consumerName, cmd.inbox.messageId);
-      }
+      await this.ackInbox(ctx, cmd);
       return replay;
     }
 
-    // ---- wallet must exist -----------------------------------------------
+    // ---- wallet must exist -------------------------------------------
     const wallet = ctx.wallet;
     if (!wallet) {
       throw new WalletNotFoundError(payload.walletId);
@@ -128,40 +129,47 @@ export class SubmitWagerTransactionUseCase {
 
     const events: IntegrationEvent<unknown>[] = [];
     const eventCtx = { correlationId, causationId: tx.id };
+    const now = new Date();
 
-    // ---- domain guards that produce a persisted REJECTED -----------------
-    let outcome: { rejected: boolean; entry?: WalletLedgerEntry };
+    // ---- domain guards that produce a persisted REJECTED --------------
+    let outcome: InMemoryOutcome;
     if (wallet.playerId !== payload.playerId) {
       tx.reject(FailureCode.WalletPlayerMismatch);
-      outcome = { rejected: true };
+      outcome = { kind: 'rejected' };
     } else if (money.currency !== wallet.currency) {
       tx.reject(FailureCode.CurrencyMismatch);
-      outcome = { rejected: true };
+      outcome = { kind: 'rejected' };
+    } else if (tx.requiresReference()) {
+      outcome = await this.handleReversal(ctx, wallet, tx, money, payload, now);
     } else {
-      outcome = this.applyKind(wallet, tx, money);
+      outcome = this.applyKind(wallet, tx, money, now);
     }
 
     const resultBalance = wallet.balance.toJSON();
 
-    if (outcome.rejected) {
-      events.push(WagerTransactionRejected.from(tx, eventCtx));
-      await ctx.insertWagerTransaction(tx, resultBalance);
-    } else {
-      events.push(WagerTransactionProcessed.from(tx, eventCtx));
-      if (outcome.entry) {
-        events.push(WalletBalanceChanged.from(wallet, outcome.entry, eventCtx));
-      }
-      await ctx.insertWagerTransaction(tx, resultBalance);
-      if (outcome.entry) {
-        await ctx.insertLedgerEntry(outcome.entry);
-        await ctx.saveWallet(wallet);
-      }
+    switch (outcome.kind) {
+      case 'pending-reference':
+        events.push(WagerTransactionPendingReference.from(tx, eventCtx));
+        await ctx.insertWagerTransaction(tx, resultBalance);
+        break;
+      case 'rejected':
+        events.push(WagerTransactionRejected.from(tx, eventCtx));
+        await ctx.insertWagerTransaction(tx, resultBalance);
+        break;
+      case 'processed':
+        events.push(WagerTransactionProcessed.from(tx, eventCtx));
+        if (outcome.entry) {
+          events.push(WalletBalanceChanged.from(wallet, outcome.entry, eventCtx));
+        }
+        await ctx.insertWagerTransaction(tx, resultBalance);
+        if (outcome.entry) {
+          await ctx.insertLedgerEntry(outcome.entry);
+          await ctx.saveWallet(wallet);
+        }
+        break;
     }
     await ctx.enqueueOutbox(events);
-
-    if (cmd.inbox && ctx.markInboxProcessed) {
-      await ctx.markInboxProcessed(cmd.inbox.consumerName, cmd.inbox.messageId);
-    }
+    await this.ackInbox(ctx, cmd);
 
     return {
       transactionId: tx.id,
@@ -173,24 +181,48 @@ export class SubmitWagerTransactionUseCase {
   }
 
   /**
-   * Applies BET / WIN / LOSS to the (locked) wallet aggregate. Pure in-memory:
-   * mutates `wallet` and `tx`, returns the ledger entry to persist (if any).
+   * REFUND / ROLLBACK. Resolves the reference by (providerId,
+   * referenceExternalTransactionId); if it is not there yet, parks the
+   * transaction as PENDING_REFERENCE for the worker to retry.
    */
+  private async handleReversal(
+    ctx: WagerTxContext,
+    wallet: NonNullable<WagerTxContext['wallet']>,
+    tx: WagerTransaction,
+    money: Money,
+    payload: WagerBusinessPayload,
+    now: Date,
+  ): Promise<InMemoryOutcome> {
+    const reference = await ctx.findByProviderRef(
+      payload.providerId,
+      payload.referenceExternalTransactionId as string,
+    );
+
+    if (!reference) {
+      tx.markPendingReference(this.referencePolicy.nextAttemptAt(0, now));
+      return { kind: 'pending-reference' };
+    }
+
+    const result = await this.reversals.apply(ctx, wallet, tx, money, reference, now);
+    return result.rejected ? { kind: 'rejected' } : { kind: 'processed', entry: result.entry };
+  }
+
+  /** Applies BET / WIN / LOSS to the (locked) wallet aggregate. */
   private applyKind(
     wallet: NonNullable<WagerTxContext['wallet']>,
     tx: WagerTransaction,
     money: Money,
-  ): { rejected: boolean; entry?: WalletLedgerEntry } {
-    const now = new Date();
+    now: Date,
+  ): InMemoryOutcome {
     switch (tx.kind) {
       case WagerTransactionKind.Loss:
         tx.markProcessed(undefined, now);
-        return { rejected: false };
+        return { kind: 'processed' };
 
       case WagerTransactionKind.Bet: {
         if (wallet.balance.isLessThan(money)) {
           tx.reject(FailureCode.InsufficientFunds);
-          return { rejected: true };
+          return { kind: 'rejected' };
         }
         const { entry } = wallet.debit({
           transactionId: tx.id,
@@ -199,7 +231,7 @@ export class SubmitWagerTransactionUseCase {
           at: now,
         });
         tx.markProcessed(undefined, now);
-        return { rejected: false, entry };
+        return { kind: 'processed', entry };
       }
 
       case WagerTransactionKind.Win: {
@@ -210,11 +242,17 @@ export class SubmitWagerTransactionUseCase {
           at: now,
         });
         tx.markProcessed(undefined, now);
-        return { rejected: false, entry };
+        return { kind: 'processed', entry };
       }
 
       default:
         throw new ValidationError(`Unsupported kind ${tx.kind}`);
+    }
+  }
+
+  private async ackInbox(ctx: WagerTxContext, cmd: SubmitWagerCommand): Promise<void> {
+    if (cmd.inbox && ctx.markInboxProcessed) {
+      await ctx.markInboxProcessed(cmd.inbox.consumerName, cmd.inbox.messageId);
     }
   }
 
