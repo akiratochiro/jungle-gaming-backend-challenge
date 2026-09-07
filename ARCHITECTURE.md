@@ -103,6 +103,9 @@ The DB is the final authority regardless of the lock:
 entry, reconciliation consistent. Also: the same bet fired **50× in parallel**
 → one debit, 49 idempotent replays, one `transactionId`.
 
+The same two scenarios run again in `test/multi-instance` across **3 separate
+application processes**, requests spread between them — §13.4, see §11.
+
 ## 5. Idempotency
 
 - The `Idempotency-Key` **header is the source of truth**. Default value
@@ -341,9 +344,62 @@ outbox lag).
 - **Concurrency** (`test/concurrency`, real parallelism via `Promise.all`
   against a live HTTP server): the §8 scenario, 50× duplicate, idempotency
   conflict.
+- **Multi‑instance** (`test/multi-instance`, `bun run test:multi-instance`) — see below.
 
-`wallet.balance == balance rebuilt from the ledger` is asserted through
-`POST /wallets/:id/reconciliation` in the concurrency tests.
+`wallet.balance == balance rebuilt from the ledger` is asserted in every
+concurrency / multi‑instance case — via `POST /wallets/:id/reconciliation`
+*and* by re‑summing the ledger straight from SQL in the test process.
+
+### Multi‑instance test (challenge §13.4)
+
+`test/multi-instance/multi-instance.spec.ts` proves correctness with **three or
+more genuinely separate processes**, not parallel requests inside one.
+
+**Orchestration** — `test/helpers/cluster.ts`:
+
+1. reserve 3 free TCP ports;
+2. `Bun.spawn(['bun','run','src/main.ts'], { env: { PORT, … } })` **three times**
+   — three independent OS processes, each its own Nest app, its own MikroORM
+   connection pool, its own `EntityManager`, its own V8/JSC heap. They share
+   *only* `DATABASE_URL` and the LocalStack endpoint (from `.env`);
+3. the SQS consumer, outbox relay and pending‑reference worker are disabled in
+   the spawned instances (`*_ENABLED=false`) so the test isolates the HTTP write
+   path — those workers have their own tests;
+4. wait for every instance's `GET /health/ready` (Postgres + SQS reachable);
+5. a **fourth** MikroORM connection, owned by the test process itself
+   (`test/helpers/db-admin.ts`), resets fixtures and reads back the final
+   invariant. It never shares anything with the instances.
+
+Teardown sends `SIGTERM` (Nest shutdown hooks) and `SIGKILL`s after 5s.
+
+**Why spawned processes and not `docker compose --scale`:** for what §13.4
+actually checks — several *unrelated* processes contending on one row — a
+container adds only namespace isolation, which is irrelevant here. Process
+spawns are an order of magnitude faster, need no image build / port‑mapping /
+load‑balancer, and are deterministic in CI. The isolation that matters (separate
+PG backends, zero shared memory) is identical.
+
+**What it runs, requests spread across the instances:**
+
+| Scenario | Distribution |
+|---|---|
+| §8 — wallet `100.00`, two `80.00` bets in parallel | bet A → instance 1, bet B → instance 2, wallet created on instance 0 |
+| idempotency — same bet (same `Idempotency-Key`) ×50 in parallel | round‑robin over all 3 instances |
+| four independent wallets, 5 bets each in parallel | round‑robin over all 3 instances |
+
+Every case asserts `wallets.balance_amount == Σ(ledger CREDIT − DEBIT)` read
+directly from SQL, exactly one `DEBIT` for the winning bet, `20.00` / `70.00` /
+`50.00` final balances, and `POST /wallets/:id/reconciliation` (queried on yet
+another instance) reporting `consistent: true`.
+
+**Why this proves "correct with N instances":** the only thing serialising the
+two concurrent debits is `SELECT … FOR UPDATE` on the `wallets` row. That lock
+is held by a **PostgreSQL backend** and released on `COMMIT` — it does not know
+or care which process, host or container opened the transaction. Three unrelated
+OS processes hit the same row; Postgres orders them; the application holds no
+in‑memory mutex, semaphore or leader that could be doing the work instead. If
+correctness depended on single‑process state, this test would show a double
+debit or a negative balance — it shows neither.
 
 ## 12. Roadmap (next slices)
 
@@ -352,5 +408,3 @@ outbox lag).
    formatter (context — `correlationId`, `messageId`, `transactionId`,
    `walletId`, `providerId` — is already threaded through).
 2. **Load test** exposed as `bun run test:load`.
-3. Multi‑instance test harness (spawn 3 `bun run src/main.ts` / `bun run worker`
-   against one DB) — correctness already holds because the lock is in PG.

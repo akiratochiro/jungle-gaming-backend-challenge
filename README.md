@@ -69,14 +69,19 @@ Queues created by `scripts/localstack-init.sh`:
 | `bun run start:dev` | start with watch mode |
 | `bun run worker` | headless workers only (SQS consumer, outbox relay, pending-reference) |
 | `bun run db:up` / `db:down` / `db:fresh` / `db:pending` | migrations |
-| `bun test` | all tests (unit + integration + concurrency) |
+| `bun run test` | unit + integration + concurrency (fast inner loop) |
 | `bun run test:unit` | domain unit tests only (no I/O) |
 | `bun run test:integration` | real Postgres + LocalStack |
-| `bun run test:concurrency` | real-parallelism race tests |
+| `bun run test:concurrency` | real-parallelism race tests (one process) |
+| `bun run test:multi-instance` | §13.4 — spawns **3 separate app processes** vs. one DB |
+| `bun run test:all` | everything, including multi-instance |
 | `bun run lint` | `tsc --noEmit` |
 
-> Integration and concurrency tests need `docker compose up -d` and `bun run db:up`
-> first. They boot a real Nest HTTP server and truncate tables between cases.
+> Integration / concurrency / multi-instance tests need `docker compose up -d`
+> and `bun run db:up` first. They boot real Nest servers and truncate tables
+> between cases. `test:multi-instance` is kept out of the default `bun run test`
+> because it launches 3 OS processes — see [ARCHITECTURE.md](./ARCHITECTURE.md)
+> §"Multi-instance test".
 
 ## API quick tour
 
