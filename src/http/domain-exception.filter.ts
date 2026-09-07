@@ -32,7 +32,12 @@ export class DomainExceptionFilter implements ExceptionFilter {
     const { status, body } = this.translate(exception);
 
     if (status >= 500) {
-      this.logger.error({ msg: 'request failed', status, error: String(exception) });
+      // Log the error class only — messages can echo request values.
+      this.logger.error({
+        msg: 'request failed',
+        status,
+        error: exception instanceof Error ? exception.name : 'UnknownError',
+      });
     }
     res.status(status).json(body);
   }

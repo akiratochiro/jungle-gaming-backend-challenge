@@ -11,8 +11,9 @@ Design decisions, trade‑offs and current scope live in **[ARCHITECTURE.md](./A
 > `REFUND` / `ROLLBACK` with reference resolution, the pending‑reference worker
 > (out‑of‑order), the **SQS consumer** (persistent inbox, ack‑after‑commit, DLQ),
 > hot‑wallet concurrency, idempotency, outbox + relay, ledger, reconciliation,
-> health checks. Not yet wired: metrics / structured‑log formatter, load test
-> (see [ARCHITECTURE.md](./ARCHITECTURE.md) §Roadmap).
+> health checks, **JSON logs + Prometheus metrics** (`GET /metrics`). Optional /
+> not done: OpenTelemetry, a dashboard, a load test (see
+> [ARCHITECTURE.md](./ARCHITECTURE.md) §Roadmap).
 
 ---
 
@@ -110,7 +111,19 @@ curl -s localhost:3000/wallets/<walletId>
 curl -s "localhost:3000/wallets/<walletId>/ledger?limit=50"
 curl -sX POST localhost:3000/wallets/<walletId>/reconciliation
 curl -s localhost:3000/health/ready
+curl -s localhost:3000/metrics
 ```
+
+### Observability
+
+Structured JSON logs on stdout, one object per line, each carrying the request's
+`correlationId` (plus `walletId` / `transactionId` / `providerId` / `messageId`
+as they become known) — propagated with `AsyncLocalStorage` across HTTP, the SQS
+consumer and the workers. No `Money` values or raw payloads are ever logged.
+`GET /metrics` serves a Prometheus exposition (own lightweight implementation)
+covering transactions by status/kind, idempotency replays, SQS retries + DLQ,
+pending‑reference retries, wallet‑lock wait/contention, outbox lag + backlog, and
+processing latency. Details and the full metric list: **[ARCHITECTURE.md](./ARCHITECTURE.md) §10**.
 
 | Endpoint | |
 |---|---|
@@ -121,7 +134,8 @@ curl -s localhost:3000/health/ready
 | `POST /wagering/transactions` | submit — see status mapping in ARCHITECTURE.md §7 |
 | `GET /wagering/transactions/:id` | by internal id |
 | `GET /providers/:providerId/wagering/transactions/:externalId` | by provider ref |
-| `GET /health/live` · `GET /health/ready` | liveness · readiness (no auth) |
+| `GET /health/live` · `GET /health/ready` | liveness · readiness — PostgreSQL + SQS (no auth) |
+| `GET /metrics` | Prometheus text format (no auth) |
 
 ## Background workers
 
@@ -154,8 +168,9 @@ env-overridable (`PENDING_REFERENCE_*`).
 src/domain/        pure domain — Money, Wallet, WagerTransaction, reversal, events
 src/application/   use cases + ports (+ ApplicationModule)
 src/infra/         MikroORM entities/mappers/UoW, SQS consumer + client, outbox relay,
-                   pending-reference worker, auth
-src/http/          controllers, DTOs, exception filter
+                   pending-reference worker, auth, observability (JSON logger,
+                   correlation ALS, Prometheus registry + metric set)
+src/http/          controllers, DTOs, exception filter, correlation middleware
 src/main.ts        HTTP + in-process workers   ·   src/worker.ts   headless workers
 scripts/db.ts      Bun-friendly migration runner
 test/              unit / integration / concurrency

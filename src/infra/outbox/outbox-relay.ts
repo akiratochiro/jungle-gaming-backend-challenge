@@ -1,7 +1,9 @@
-import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { EntityManager } from '@mikro-orm/postgresql';
 import { OutboxMessageEntity } from '../database/entities/outbox-message.entity';
 import { SqsClientProvider } from '../messaging/sqs-client.provider';
+import { Metrics } from '../observability/metrics';
+import { runWithCorrelation } from '../observability/correlation';
 
 const BACKOFF_BASE_MS = 1_000;
 const BACKOFF_CAP_MS = 60_000;
@@ -15,7 +17,7 @@ const BACKOFF_CAP_MS = 60_000;
  * the FIFO MessageDeduplicationId (the event id).
  */
 @Injectable()
-export class OutboxRelay implements OnModuleDestroy {
+export class OutboxRelay implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(OutboxRelay.name);
   private timer?: ReturnType<typeof setTimeout>;
   private running = false;
@@ -24,7 +26,20 @@ export class OutboxRelay implements OnModuleDestroy {
   constructor(
     private readonly em: EntityManager,
     private readonly sqs: SqsClientProvider,
+    private readonly metrics: Metrics,
   ) {}
+
+  onModuleInit(): void {
+    // Scrape-time gauge: how far behind the relay is.
+    this.metrics.outboxPending.collect(async () => {
+      const rows = await this.em
+        .getConnection()
+        .execute<Array<{ n: number }>>(
+          'SELECT count(*)::int AS n FROM outbox_messages WHERE published_at IS NULL',
+        );
+      return rows[0]?.n ?? 0;
+    });
+  }
 
   start(intervalMs = Number(process.env.OUTBOX_POLL_INTERVAL_MS ?? 1000)): void {
     const tick = async () => {
@@ -64,26 +79,46 @@ export class OutboxRelay implements OnModuleDestroy {
           const id = row.id as string;
           const payload = row.payload as Record<string, unknown>;
           const eventId = (payload.eventId as string) ?? id;
-          try {
-            await this.sqs.sendFifo({
-              queueUrl: this.sqs.config.eventsQueueUrl,
-              body: JSON.stringify(payload),
-              groupId: row.aggregate_id as string,
-              dedupId: eventId,
-            });
-            await em.execute('UPDATE outbox_messages SET published_at = now() WHERE id = ?', [id]);
-            published += 1;
-          } catch (e) {
-            const attempts = Number(row.attempts ?? 0) + 1;
-            const delay = Math.min(BACKOFF_BASE_MS * 2 ** attempts, BACKOFF_CAP_MS);
-            await em.execute(
-              `UPDATE outbox_messages
-                 SET attempts = ?, next_attempt_at = now() + (? || ' milliseconds')::interval
-                 WHERE id = ?`,
-              [attempts, delay, id],
-            );
-            this.logger.warn({ msg: 'outbox publish failed', id, attempts, error: String(e) });
-          }
+          const data = (payload.data ?? {}) as Record<string, unknown>;
+          const occurredAtMs = new Date(row.occurred_at as string).getTime();
+
+          const done = await runWithCorrelation(
+            {
+              correlationId: payload.correlationId as string,
+              walletId: row.aggregate_id as string,
+              transactionId: data.transactionId as string | undefined,
+            },
+            async () => {
+              try {
+                await this.sqs.sendFifo({
+                  queueUrl: this.sqs.config.eventsQueueUrl,
+                  body: JSON.stringify(payload),
+                  groupId: row.aggregate_id as string,
+                  dedupId: eventId,
+                });
+                await em.execute('UPDATE outbox_messages SET published_at = now() WHERE id = ?', [id]);
+                this.metrics.outboxLag.observe(Math.max(0, (Date.now() - occurredAtMs) / 1000));
+                return true;
+              } catch (e) {
+                const attempts = Number(row.attempts ?? 0) + 1;
+                const delay = Math.min(BACKOFF_BASE_MS * 2 ** attempts, BACKOFF_CAP_MS);
+                await em.execute(
+                  `UPDATE outbox_messages
+                     SET attempts = ?, next_attempt_at = now() + (? || ' milliseconds')::interval
+                     WHERE id = ?`,
+                  [attempts, delay, id],
+                );
+                this.logger.warn({
+                  msg: 'outbox publish failed',
+                  eventType: payload.eventType,
+                  attempts,
+                  error: e instanceof Error ? e.name : 'Error',
+                });
+                return false;
+              }
+            },
+          );
+          if (done) published += 1;
         }
         return published;
       });

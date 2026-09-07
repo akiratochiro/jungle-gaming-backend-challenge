@@ -9,6 +9,8 @@ import {
   WalletBalanceChanged,
 } from '../../domain/events/wager-events';
 import { WagerUnitOfWork } from '../ports/wager-unit-of-work';
+import { Metrics } from '../../infra/observability/metrics';
+import { enrichCorrelation } from '../../infra/observability/correlation';
 import { ApplyReversalService } from './apply-reversal.service';
 import { ReferenceResolutionPolicy } from './reference-resolution-policy';
 
@@ -20,7 +22,12 @@ export interface ResolvePendingReferenceCommand {
 export type ResolvePendingReferenceResult =
   | { outcome: 'noop' }
   | { outcome: 'rescheduled'; attempts: number }
-  | { outcome: 'processed' | 'rejected'; status: WagerTransactionStatus; failureCode?: FailureCode };
+  | {
+      outcome: 'processed' | 'rejected';
+      status: WagerTransactionStatus;
+      failureCode?: FailureCode;
+      kind: string;
+    };
 
 /**
  * Re-attempts one PENDING_REFERENCE transaction, under the wallet lock. Called
@@ -35,10 +42,12 @@ export class ResolvePendingReferenceUseCase {
     private readonly uow: WagerUnitOfWork,
     private readonly reversals: ApplyReversalService,
     private readonly policy: ReferenceResolutionPolicy,
+    private readonly metrics: Metrics,
   ) {}
 
-  execute(cmd: ResolvePendingReferenceCommand): Promise<ResolvePendingReferenceResult> {
-    return this.uow.runForWallet(cmd.walletId, async (ctx) => {
+  async execute(cmd: ResolvePendingReferenceCommand): Promise<ResolvePendingReferenceResult> {
+    enrichCorrelation({ transactionId: cmd.transactionId, walletId: cmd.walletId });
+    const result = await this.uow.runForWallet<ResolvePendingReferenceResult>(cmd.walletId, async (ctx) => {
       // Re-read under the wallet lock: another worker on another instance may
       // have already resolved or rescheduled this row between the scan and here.
       const tx = await ctx.findById(cmd.transactionId);
@@ -66,7 +75,7 @@ export class ResolvePendingReferenceUseCase {
           events.push(WagerTransactionRejected.from(tx, eventCtx));
           await ctx.updateWagerTransaction(tx, wallet.balance.toJSON());
           await ctx.enqueueOutbox(events);
-          return { outcome: 'rejected', status: tx.status, failureCode: tx.failureCode };
+          return { outcome: 'rejected', status: tx.status, failureCode: tx.failureCode, kind: tx.kind };
         }
         tx.markPendingReference(this.policy.nextAttemptAt(tx.referenceResolutionAttempts, now));
         await ctx.updateWagerTransaction(tx);
@@ -94,7 +103,20 @@ export class ResolvePendingReferenceUseCase {
         outcome: result.rejected ? 'rejected' : 'processed',
         status: tx.status,
         failureCode: tx.failureCode,
+        kind: tx.kind,
       };
     });
+
+    this.metrics.pendingReferenceRetries.inc({ outcome: result.outcome });
+    if (result.outcome === 'processed' || result.outcome === 'rejected') {
+      this.metrics.wagerTransactions.inc({ status: result.status, kind: result.kind });
+      this.logger.log({
+        msg: 'pending reference resolved',
+        outcome: result.outcome,
+        status: result.status,
+        failureCode: result.failureCode ?? null,
+      });
+    }
+    return result;
   }
 }

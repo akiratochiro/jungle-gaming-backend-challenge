@@ -1,6 +1,8 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { EntityManager } from '@mikro-orm/postgresql';
+import { uuidv7 } from 'uuidv7';
 import { ResolvePendingReferenceUseCase } from '../../application/wager/resolve-pending-reference.use-case';
+import { runWithCorrelation } from '../observability/correlation';
 
 /**
  * Scheduled scan for REFUND/ROLLBACK transactions parked as PENDING_REFERENCE
@@ -62,15 +64,23 @@ export class PendingReferenceWorker implements OnModuleDestroy {
 
       let touched = 0;
       for (const row of rows) {
-        try {
-          const res = await this.resolve.execute({
-            transactionId: row.id,
-            walletId: row.wallet_id,
-          });
-          if (res.outcome !== 'noop') touched += 1;
-        } catch (e) {
-          this.logger.error({ msg: 'pending-reference resolve failed', id: row.id, error: String(e) });
-        }
+        await runWithCorrelation(
+          { correlationId: uuidv7(), transactionId: row.id, walletId: row.wallet_id },
+          async () => {
+            try {
+              const res = await this.resolve.execute({
+                transactionId: row.id,
+                walletId: row.wallet_id,
+              });
+              if (res.outcome !== 'noop') touched += 1;
+            } catch (e) {
+              this.logger.error({
+                msg: 'pending-reference resolve failed',
+                error: e instanceof Error ? e.name : 'Error',
+              });
+            }
+          },
+        );
       }
       return touched;
     } finally {

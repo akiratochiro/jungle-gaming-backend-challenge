@@ -5,7 +5,8 @@
 > `PENDING_REFERENCE` worker (out‑of‑order references), the **SQS consumer**
 > (persistent inbox, ack‑after‑commit, DLQ), pessimistic hot‑wallet concurrency,
 > persistent idempotency, transactional outbox + relay, ledger, reconciliation,
-> health checks. **Not yet wired**: metrics / structured‑log formatter, load
+> health checks, **JSON structured logs + Prometheus metrics** (`/metrics`).
+> **Not implemented** (optional): OpenTelemetry, a bundled dashboard, a load
 > test. See *Roadmap*.
 
 ---
@@ -316,14 +317,96 @@ cross‑checked against the payload. **Queue messages are treated as a trusted
 internal channel**, but the provider identity *in the message* is still subject
 to the same domain validations (player owns wallet, currency matches, …).
 
-## 10. Observability (partial)
+## 10. Observability
 
-Structured context (`correlationId`, `causationId`) flows through use cases and
-onto every event envelope. `X-Correlation-Id` is honoured on inbound HTTP.
-Health: `/health/live` (process), `/health/ready` (PostgreSQL `SELECT 1` + SQS
-`GetQueueAttributes`). **TODO**: JSON log formatter wired globally, Prometheus
-metrics (transactions by status, duplicates, retries, DLQ depth, lock waits,
-outbox lag).
+### 10.1 Structured logs
+
+**Format:** one JSON object per line on **stdout** (`src/infra/observability/json-logger.ts`,
+registered as the Nest logger in `main.ts` and `worker.ts`). Every line:
+
+```json
+{"ts":"2026-…Z","level":"info","logger":"SubmitWagerTransactionUseCase",
+ "msg":"wager transaction settled",
+ "correlationId":"…","transactionId":"…","walletId":"…","providerId":"provider-a",
+ "source":"http","kind":"BET","status":"PROCESSED"}
+```
+
+`ts`, `level`, `logger`, `msg` are always present; the five correlation fields
+(`correlationId`, `messageId`, `transactionId`, `walletId`, `providerId`) are
+attached automatically whenever they are known; the rest is per-call structured
+meta. Call sites pass `logger.log({ msg, ...fields })` — **never** a
+string-interpolated value.
+
+**Correlation propagation** — a single `AsyncLocalStorage`
+(`src/infra/observability/correlation.ts`):
+
+| Entry point | Scope opened by | Seed |
+|---|---|---|
+| HTTP | `CorrelationMiddleware` (global, `forRoutes('*')`) | inbound `X-Correlation-Id` or a fresh UUIDv7; echoed on the response |
+| SQS consumer | `runWithCorrelation` per message | `sqs:<messageId>`, `messageId`, `providerId`, `walletId` |
+| Outbox relay | `runWithCorrelation` per row | the event's own `correlationId`, `walletId`, `transactionId` |
+| Pending-reference worker | `runWithCorrelation` per row | fresh UUIDv7, `transactionId`, `walletId` |
+
+The use case then calls `enrichCorrelation({ transactionId, providerId, walletId })`
+as those become known, so downstream log lines (and any nested worker) inherit
+them.
+
+### 10.2 What is kept out of the logs
+
+- **No `Money` values.** `Money.toString()` / amounts never appear in a `msg` or
+  a meta field. Balance movement is visible via metrics and the integration
+  events, not logs. (`test/integration/observability.spec.ts` asserts a chosen
+  amount never appears in any captured line.)
+- **No raw payloads.** The HTTP body and the SQS message `data` object are never
+  logged.
+- **DLQ metadata** carries only `failureClass` (`malformed` / `permanent` /
+  `exhausted`) + the exception class name — not the exception message, which
+  could echo an invalid amount from the payload. The original body is on the DLQ
+  for full detail.
+- **5xx responses** log the error class name only (`DomainExceptionFilter`).
+
+### 10.3 Metrics
+
+**Mechanism:** a small dependency-free Prometheus implementation
+(`src/infra/observability/prometheus.ts`, ~180 lines: `Counter`, `Gauge`,
+`Histogram`, `Registry`). The metric set is small and fixed, the exposition
+format is simple, and avoiding `prom-client` keeps the dependency list honest —
+the trade-off is that we own the text-format correctness (covered by
+`prometheus.spec.ts`).
+
+**Exposed at `GET /metrics`** — unauthenticated (like health),
+`Content-Type: text/plain; version=0.0.4`. Point a Prometheus scrape config at
+it, or `curl localhost:3000/metrics`.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `wager_transactions_total` | counter | `status`, `kind` | transactions by terminal status (covers HTTP, SQS, `OPENING`, and worker-resolved reversals) |
+| `wager_idempotency_replays_total` | counter | — | duplicate request/message → original outcome replayed |
+| `sqs_message_retries_total` | counter | — | messages whose visibility was extended for a transient retry |
+| `sqs_messages_dlq_total` | counter | `reason` | messages moved to the DLQ (`malformed`/`permanent`/`exhausted`) |
+| `pending_reference_retries_total` | counter | `outcome` | pending-reference attempts (`noop`/`rescheduled`/`processed`/`rejected`) |
+| `wallet_lock_contended_total` | counter | — | pessimistic wallet locks that waited > 20 ms for another holder |
+| `wallet_lock_wait_seconds` | histogram | — | time to acquire the wallet lock |
+| `outbox_lag_seconds` | histogram | — | `publishedAt − occurredAt` per relayed event |
+| `outbox_pending_messages` | gauge | — | unpublished outbox rows, `COUNT(*)` at scrape time |
+| `wager_processing_seconds` | histogram | `source`, `outcome` | end-to-end latency of the shared use case |
+
+*Lock contention with pessimistic locking* is not an error but a wait:
+`wallet_lock_wait_seconds` times the `SELECT … FOR UPDATE`, and any wait past the
+20 ms threshold also bumps `wallet_lock_contended_total`.
+
+### 10.4 Health
+
+Unchanged and unauthenticated. `GET /health/live` — process is up.
+`GET /health/ready` — `SELECT 1` against PostgreSQL **and**
+`GetQueueAttributes` against SQS; `503` with a per-check breakdown if either
+fails. `/metrics` is likewise open.
+
+### 10.5 Out of scope
+
+OpenTelemetry traces and a bundled dashboard — explicitly optional in the brief,
+not implemented. The `correlationId` on every log line and event envelope is the
+hook a tracing layer would build on.
 
 ## 11. Testing
 
@@ -340,7 +423,16 @@ outbox lag).
   exhausted → `REFERENCE_NOT_FOUND`. **SQS consumer** — happy path + ack,
   redelivery dedup, crash‑after‑commit replay, business rejection → ack,
   malformed / unknown wallet / `OPENING` → DLQ with a reason.
-- **Policy** (`bun test src`): the backoff schedule and the ~13.5 min window.
+  **Observability** — every log line carries the request's `correlationId`
+  (+ `walletId` / `transactionId` / `providerId`); a chosen `Money` amount and
+  the raw payload never appear in any captured line; `/metrics` increments
+  `wager_transactions_total{status,kind}`, `wager_idempotency_replays_total`,
+  `sqs_messages_dlq_total{reason}`, `wager_processing_seconds`,
+  `wallet_lock_wait_seconds` on the expected events; `/health/*` and `/metrics`
+  answer without auth.
+- **Policy / metrics** (`bun test src`): the backoff schedule and the ~13.5 min
+  window; the Prometheus text format (counter series, histogram
+  `_bucket`/`_sum`/`_count`, gauge collectors, label escaping).
 - **Concurrency** (`test/concurrency`, real parallelism via `Promise.all`
   against a live HTTP server): the §8 scenario, 50× duplicate, idempotency
   conflict.
@@ -403,8 +495,7 @@ debit or a negative balance — it shows neither.
 
 ## 12. Roadmap (next slices)
 
-1. **Metrics + JSON logs**: Prometheus counters (transactions by status,
-   duplicates, retries, DLQ depth, lock waits, outbox lag), a global JSON log
-   formatter (context — `correlationId`, `messageId`, `transactionId`,
-   `walletId`, `providerId` — is already threaded through).
-2. **Load test** exposed as `bun run test:load`.
+1. **Load test** exposed as `bun run test:load`.
+2. **OpenTelemetry** — spans around the use case, the UoW transaction and each
+   SQS/outbox hop, exported via OTLP; the `correlationId` becomes the trace id.
+3. A bundled Grafana dashboard for the `/metrics` series.

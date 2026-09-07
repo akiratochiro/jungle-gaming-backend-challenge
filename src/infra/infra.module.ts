@@ -11,11 +11,13 @@ import { SqsClientProvider } from './messaging/sqs-client.provider';
 import { OutboxRelay } from './outbox/outbox-relay';
 import { ProviderIdentityPort, NoopProviderIdentity } from './auth/provider-identity.port';
 import { AuthGuard } from './auth/noop-auth.guard';
+import { Metrics } from './observability/metrics';
 
 @Global()
 @Module({
   imports: [MikroOrmModule.forRoot(mikroOrmConfig)],
   providers: [
+    Metrics,
     { provide: IdGenerator, useClass: Uuidv7Generator },
     { provide: WagerUnitOfWork, useClass: MikroWagerUnitOfWork },
     { provide: WalletProvisioningUnitOfWork, useClass: MikroWalletProvisioningUnitOfWork },
@@ -26,6 +28,7 @@ import { AuthGuard } from './auth/noop-auth.guard';
     OutboxRelay,
   ],
   exports: [
+    Metrics,
     IdGenerator,
     WagerUnitOfWork,
     WalletProvisioningUnitOfWork,

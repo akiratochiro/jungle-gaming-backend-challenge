@@ -1,5 +1,7 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { Money, MoneyProps } from '../../domain/shared/money';
+import { Metrics } from '../../infra/observability/metrics';
+import { enrichCorrelation } from '../../infra/observability/correlation';
 import { WalletLedgerEntry } from '../../domain/wallet/wallet-ledger-entry';
 import { WagerTransactionKind, WagerTransactionStatus } from '../../domain/wager/enums';
 import { FailureCode } from '../../domain/wager/failure-code';
@@ -51,34 +53,50 @@ type InMemoryOutcome =
 
 @Injectable()
 export class SubmitWagerTransactionUseCase {
+  private readonly logger = new Logger(SubmitWagerTransactionUseCase.name);
+
   constructor(
     private readonly uow: WagerUnitOfWork,
     private readonly ids: IdGenerator,
     private readonly reversals: ApplyReversalService,
     private readonly referencePolicy: ReferenceResolutionPolicy,
+    private readonly metrics: Metrics,
   ) {}
 
   async execute(cmd: SubmitWagerCommand): Promise<SubmitWagerResult> {
     const { payload } = cmd;
+    const source = cmd.inbox ? 'sqs' : 'http';
+    enrichCorrelation({ providerId: payload.providerId, walletId: payload.walletId });
 
-    if (!SUBMITTABLE_KINDS.has(payload.kind)) {
-      throw new ValidationError(`Kind ${payload.kind} cannot be submitted`);
+    const start = performance.now();
+    let outcomeLabel = 'error';
+    try {
+      if (!SUBMITTABLE_KINDS.has(payload.kind)) {
+        throw new ValidationError(`Kind ${payload.kind} cannot be submitted`);
+      }
+      if (
+        (payload.kind === WagerTransactionKind.Refund ||
+          payload.kind === WagerTransactionKind.Rollback) &&
+        !payload.referenceExternalTransactionId
+      ) {
+        throw new ValidationError(`${payload.kind} requires referenceExternalTransactionId`);
+      }
+
+      // Entry-contract validation of the monetary amount.
+      const money = Money.from(payload.money);
+      const payloadHash = computePayloadHash(payload);
+
+      const result = await this.uow.runForWallet(payload.walletId, (ctx) =>
+        this.process(ctx, cmd, money, payloadHash),
+      );
+      outcomeLabel = result.idempotentReplay ? 'replay' : result.status.toLowerCase();
+      return result;
+    } finally {
+      this.metrics.processing.observe((performance.now() - start) / 1000, {
+        source,
+        outcome: outcomeLabel,
+      });
     }
-    if (
-      (payload.kind === WagerTransactionKind.Refund ||
-        payload.kind === WagerTransactionKind.Rollback) &&
-      !payload.referenceExternalTransactionId
-    ) {
-      throw new ValidationError(`${payload.kind} requires referenceExternalTransactionId`);
-    }
-
-    // Entry-contract validation of the monetary amount.
-    const money = Money.from(payload.money);
-    const payloadHash = computePayloadHash(payload);
-
-    return this.uow.runForWallet(payload.walletId, (ctx) =>
-      this.process(ctx, cmd, money, payloadHash),
-    );
   }
 
   private async process(
@@ -103,6 +121,13 @@ export class SubmitWagerTransactionUseCase {
     const replay = await this.replayByKey(ctx, cmd.idempotencyKey, payloadHash);
     if (replay) {
       await this.ackInbox(ctx, cmd);
+      enrichCorrelation({ transactionId: replay.transactionId });
+      this.metrics.idempotencyReplays.inc();
+      this.logger.log({
+        msg: 'idempotent replay served',
+        source: cmd.inbox ? 'sqs' : 'http',
+        status: replay.status,
+      });
       return replay;
     }
 
@@ -126,6 +151,7 @@ export class SubmitWagerTransactionUseCase {
       money,
       referenceExternalTransactionId: payload.referenceExternalTransactionId,
     });
+    enrichCorrelation({ transactionId: tx.id });
 
     const events: IntegrationEvent<unknown>[] = [];
     const eventCtx = { correlationId, causationId: tx.id };
@@ -170,6 +196,16 @@ export class SubmitWagerTransactionUseCase {
     }
     await ctx.enqueueOutbox(events);
     await this.ackInbox(ctx, cmd);
+
+    this.metrics.wagerTransactions.inc({ status: tx.status, kind: tx.kind });
+    this.logger.log({
+      msg: 'wager transaction settled',
+      source: cmd.inbox ? 'sqs' : 'http',
+      kind: tx.kind,
+      status: tx.status,
+      failureCode: tx.failureCode ?? null,
+      balanceChanged: outcome.kind === 'processed' && Boolean(outcome.entry),
+    });
 
     return {
       transactionId: tx.id,

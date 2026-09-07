@@ -1,9 +1,11 @@
 import 'reflect-metadata';
-import { ValidationPipe } from '@nestjs/common';
+import { LoggerService, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { MikroORM } from '@mikro-orm/postgresql';
 import { AppModule } from '../../src/app.module';
 import { DomainExceptionFilter } from '../../src/http/domain-exception.filter';
+import { JsonLogger } from '../../src/infra/observability/json-logger';
+import { resetLogSink, setLogSink } from '../../src/infra/observability/log-sink';
 import ormConfig from '../../src/infra/database/mikro-orm.config';
 
 export interface TestApp {
@@ -13,8 +15,36 @@ export interface TestApp {
   get: <T>(token: unknown) => T;
 }
 
-export async function startTestApp(): Promise<TestApp> {
-  const app = await NestFactory.create(AppModule, { logger: false });
+export interface StartTestAppOptions {
+  /** Route Nest logs through JsonLogger (default: silent). */
+  jsonLogs?: boolean;
+}
+
+/** Capture every structured log line for assertions. Call `stop()` in afterEach/afterAll. */
+export function captureLogs(): {
+  lines: string[];
+  records(): Array<Record<string, unknown>>;
+  stop(): void;
+} {
+  const lines: string[] = [];
+  setLogSink((line) => lines.push(line.replace(/\n$/, '')));
+  return {
+    lines,
+    records: () =>
+      lines.map((l) => {
+        try {
+          return JSON.parse(l) as Record<string, unknown>;
+        } catch {
+          return { raw: l };
+        }
+      }),
+    stop: () => resetLogSink(),
+  };
+}
+
+export async function startTestApp(opts: StartTestAppOptions = {}): Promise<TestApp> {
+  const logger: LoggerService | false = opts.jsonLogs ? new JsonLogger() : false;
+  const app = await NestFactory.create(AppModule, { logger });
   app.useGlobalPipes(
     new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),
   );

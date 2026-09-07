@@ -5,6 +5,7 @@ import { AppModule } from './app.module';
 import { OutboxRelay } from './infra/outbox/outbox-relay';
 import { PendingReferenceWorker } from './infra/workers/pending-reference.worker';
 import { SqsWagerConsumer } from './infra/messaging/sqs-wager-consumer';
+import { JsonLogger } from './infra/observability/json-logger';
 
 /**
  * Headless worker process — the SQS consumer, the outbox relay and the
@@ -14,7 +15,7 @@ import { SqsWagerConsumer } from './infra/messaging/sqs-wager-consumer';
  *   bun run worker
  */
 async function bootstrap() {
-  const app = await NestFactory.createApplicationContext(AppModule, { bufferLogs: false });
+  const app = await NestFactory.createApplicationContext(AppModule, { logger: new JsonLogger() });
   app.enableShutdownHooks();
 
   const log = new Logger('worker');

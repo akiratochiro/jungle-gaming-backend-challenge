@@ -146,7 +146,8 @@ describe('SQS consumer', () => {
 
     const dlq = await drainQueue(sqs, sqs.config.dlqUrl);
     expect(dlq).toHaveLength(1);
-    expect(dlq[0]?.attributes.failureReason).toContain('malformed');
+    expect(dlq[0]?.attributes.failureClass).toBe('malformed');
+    expect(dlq[0]?.attributes.errorName).toBe('MalformedMessageError');
     expect(dlq[0]?.attributes.sourceQueue).toBe(sqs.config.requestQueueUrl);
   });
 
@@ -160,7 +161,8 @@ describe('SQS consumer', () => {
 
     const dlq = await drainQueue(sqs, sqs.config.dlqUrl);
     expect(dlq).toHaveLength(1);
-    expect(dlq[0]?.attributes.failureReason).toContain('permanent');
+    expect(dlq[0]?.attributes.failureClass).toBe('permanent');
+    expect(dlq[0]?.attributes.errorName).toBe('WalletNotFoundError');
     expect(await drainQueue(sqs, sqs.config.requestQueueUrl)).toHaveLength(0);
   });
 

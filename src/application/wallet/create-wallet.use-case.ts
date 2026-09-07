@@ -1,6 +1,8 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { Money, MoneyProps } from '../../domain/shared/money';
-import { WagerTransactionKind } from '../../domain/wager/enums';
+import { WagerTransactionKind, WagerTransactionStatus } from '../../domain/wager/enums';
+import { Metrics } from '../../infra/observability/metrics';
+import { enrichCorrelation } from '../../infra/observability/correlation';
 import { WagerTransaction } from '../../domain/wager/wager-transaction';
 import { Wallet } from '../../domain/wallet/wallet';
 import { IntegrationEvent } from '../../domain/events/integration-event';
@@ -27,16 +29,21 @@ export interface CreateWalletResult {
 
 @Injectable()
 export class CreateWalletUseCase {
+  private readonly logger = new Logger(CreateWalletUseCase.name);
+
   constructor(
     private readonly uow: WalletProvisioningUnitOfWork,
     private readonly ids: IdGenerator,
+    private readonly metrics: Metrics,
   ) {}
 
   async execute(cmd: CreateWalletCommand): Promise<CreateWalletResult> {
     const initial = Money.from(cmd.initialBalance);
     const walletId = this.ids.next();
     const wallet = Wallet.open({ id: walletId, playerId: cmd.playerId, initialBalance: initial });
+    enrichCorrelation({ walletId });
 
+    let openingBooked = false;
     await this.uow.run(async (ctx) => {
       await ctx.insertWallet(wallet);
 
@@ -77,7 +84,17 @@ export class CreateWalletUseCase {
         WalletBalanceChanged.from(wallet, entry, eventCtx),
       ];
       await ctx.enqueueOutbox(events);
+      enrichCorrelation({ transactionId: txId });
+      openingBooked = true;
     });
+
+    if (openingBooked) {
+      this.metrics.wagerTransactions.inc({
+        status: WagerTransactionStatus.Processed,
+        kind: WagerTransactionKind.Opening,
+      });
+    }
+    this.logger.log({ msg: 'wallet opened', openingBooked });
 
     return {
       id: wallet.id,

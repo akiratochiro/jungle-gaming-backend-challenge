@@ -17,10 +17,14 @@ import { WagerTransactionEntity } from './entities/wager-transaction.entity';
 import { InboxMessageEntity } from './entities/inbox-message.entity';
 import { OutboxMessageEntity } from './entities/outbox-message.entity';
 import { LedgerMapper, WalletMapper, WagerTxMapper } from './mappers';
+import { LOCK_CONTENTION_THRESHOLD_SECONDS, Metrics } from '../observability/metrics';
 
 @Injectable()
 export class MikroWagerUnitOfWork extends WagerUnitOfWork {
-  constructor(private readonly em: EntityManager) {
+  constructor(
+    private readonly em: EntityManager,
+    private readonly metrics: Metrics,
+  ) {
     super();
   }
 
@@ -29,11 +33,17 @@ export class MikroWagerUnitOfWork extends WagerUnitOfWork {
     fn: (ctx: WagerTxContext) => Promise<T>,
   ): Promise<T> {
     return this.em.transactional(async (em) => {
+      const lockStart = performance.now();
       const walletEntity = await em.findOne(
         WalletEntity,
         { id: walletId },
         { lockMode: LockMode.PESSIMISTIC_WRITE },
       );
+      const lockWaitSeconds = (performance.now() - lockStart) / 1000;
+      this.metrics.walletLockWait.observe(lockWaitSeconds);
+      if (lockWaitSeconds > LOCK_CONTENTION_THRESHOLD_SECONDS) {
+        this.metrics.walletLockContended.inc();
+      }
       const wallet = walletEntity ? WalletMapper.toDomain(walletEntity) : null;
 
       const ctx: WagerTxContext = {
