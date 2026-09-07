@@ -1,13 +1,17 @@
 # Architecture & Decisions
 
-> Status. Implemented end‑to‑end: wallet creation (`OPENING`), `BET` / `WIN` /
-> `LOSS`, `REFUND` / `ROLLBACK` (with reference resolution), the
-> `PENDING_REFERENCE` worker (out‑of‑order references), the **SQS consumer**
+> **Status — every scored requirement is implemented.** Wallet creation
+> (`OPENING`), `BET` / `WIN` / `LOSS`, `REFUND` / `ROLLBACK` with reference
+> resolution, the `PENDING_REFERENCE` worker (out‑of‑order), the SQS consumer
 > (persistent inbox, ack‑after‑commit, DLQ), pessimistic hot‑wallet concurrency,
-> persistent idempotency, transactional outbox + relay, ledger, reconciliation,
-> health checks, **JSON structured logs + Prometheus metrics** (`/metrics`).
-> **Not implemented** (optional): OpenTelemetry, a bundled dashboard, a load
-> test. See *Roadmap*.
+> persistent idempotency, transactional outbox + relay, immutable ledger,
+> reconciliation, health checks, JSON structured logs + Prometheus `/metrics`,
+> versioned & reversible migrations, real integration / concurrency /
+> multi‑instance (§13.4) tests.
+>
+> **Optional differentials not done:** the load test (`bun run test:load`),
+> OpenTelemetry traces, a bundled dashboard, and double‑entry bookkeeping — all
+> explicitly optional in the brief. See §12.
 
 ---
 
@@ -143,9 +147,19 @@ as the wallet/ledger/wager writes. Events are never published before commit.
   `MessageGroupId = aggregateId` (per‑wallet ordering) → a duplicate publish is
   absorbed by the broker and is safe for consumers regardless.
 - `published_at` is set **only after** a successful send. Crash between commit
-  and publish just leaves the row pending for another relay (covered by
-  `test/integration/outbox.spec.ts`).
+  and publish just leaves the row pending for another relay; **two concurrent
+  relays** share the outbox with no loss and no double-publish
+  (`test/integration/outbox.spec.ts`, §13.6).
 - Send failure → exponential backoff via `attempts` / `next_attempt_at`.
+
+**Why `InboxMessage` / `OutboxMessage` are plain rows, not encapsulated
+aggregates** (unlike `Wallet` / `WagerTransaction` / `Money` / `WalletLedgerEntry`,
+which are): they carry **no domain invariant** — an inbox row is "seen", an
+outbox row is "pending → published / retry". Those trivial state changes live,
+with explicit names, in the component that owns them: the UoW writes inbox +
+outbox atomically alongside the financial rows; the relay owns publish / backoff.
+Wrapping them in domain classes + a mapper would add a layer for zero invariant
+benefit. `§6.5`'s skeletons are explicitly "esqueletos de referência".
 
 Events implemented: `WagerTransactionProcessed` (incl. `LOSS`),
 `WagerTransactionRejected`, `WalletBalanceChanged` (only when the balance moved),
@@ -299,13 +313,35 @@ A provider can branch on the status code alone:
 Mapping lives in one place: `WageringController.statusFor` for result statuses,
 `DomainExceptionFilter` for thrown errors. Health endpoints are unauthenticated.
 
-## 8. Failure codes
+## 8. Failure codes & terminal states
 
 `src/domain/wager/failure-code.ts`. Notably `INSUFFICIENT_FUNDS` (a bet with no
 balance) is **distinct** from `REVERSAL_WOULD_OVERDRAW` (a reversal that would
 push the balance negative) — operationally different, per §7.9. Reference
 problems are split: `REFERENCE_NOT_FOUND`, `REFERENCE_NOT_PROCESSED`,
 `REFERENCE_MISMATCH`, `REFERENCE_KIND_NOT_ALLOWED`, `REFERENCE_ALREADY_REVERSED`.
+
+**Valid transitions** of `WagerTransaction`:
+
+```
+PENDING ──────────► PROCESSED        (terminal)
+   │  └───────────► REJECTED         (terminal)
+   └──► PENDING_REFERENCE ──► PROCESSED / REJECTED   (worker; PENDING_REFERENCE→PENDING_REFERENCE reschedule)
+(any non-terminal) ──► FAILED        (terminal, reserved — see below)
+```
+`assertNotTerminal` throws `InvalidTransactionStateError` on any transition out
+of `PROCESSED` / `REJECTED` / `FAILED`.
+
+**`FAILED` is defined but the current design never reaches it, by construction.**
+An accepted transaction is persisted and applied in **one** SQL transaction
+(§6, §11); a permanent infrastructure error at any step rolls the whole thing
+back, so there is no half-applied row to mark. The failure is instead audited
+where the retry decision lives — the HTTP caller gets `503`, and an SQS message
+lands on the DLQ with a `failureClass` (the durable audit record). `FAILED` +
+the `fail(code)` transition + the `503` mapping are kept ready for a future path
+that *does* leave a persisted PENDING row it cannot finish (e.g. a
+pending-reference resolution that exhausts retries against a broken dependency
+rather than a missing reference).
 
 ## 9. Authentication — deliberately not implemented
 
@@ -365,6 +401,11 @@ them.
   for full detail.
 - **5xx responses** log the error class name only (`DomainExceptionFilter`).
 
+The **one deliberate exception**: a reconciliation divergence (§9) logs the
+**residual delta** (`differenceAmount`) plus `walletId` and `checkedEntries` — the
+discrepancy *is* the diagnostic, and it is a computed integrity residual, not a
+stored balance or a transaction amount. The two full balances are never logged.
+
 ### 10.3 Metrics
 
 **Mechanism:** a small dependency-free Prometheus implementation
@@ -390,6 +431,8 @@ it, or `curl localhost:3000/metrics`.
 | `outbox_lag_seconds` | histogram | — | `publishedAt − occurredAt` per relayed event |
 | `outbox_pending_messages` | gauge | — | unpublished outbox rows, `COUNT(*)` at scrape time |
 | `wager_processing_seconds` | histogram | `source`, `outcome` | end-to-end latency of the shared use case |
+| `wallet_reconciliation_checks_total` | counter | `result` | reconciliation runs (`consistent` / `divergent`) |
+| `wallet_reconciliation_divergences_total` | counter | — | reconciliation runs where stored balance ≠ ledger |
 
 *Lock contention with pessimistic locking* is not an error but a wait:
 `wallet_lock_wait_seconds` times the `SELECT … FOR UPDATE`, and any wait past the
@@ -414,15 +457,24 @@ hook a tracing layer would build on.
   `Wallet` invariants; `WagerTransaction` transitions + `ledgerDirectionFor`;
   `validateReversal` rules; currency conflict; idempotency‑key/payload divergence.
 - **Integration** (`test/integration`, real PostgreSQL + real LocalStack SQS):
-  outbox atomicity, relay publish‑once, crash‑pending rows, rejection emits no
-  ledger entry; `REFUND`/`ROLLBACK` happy paths, reverse‑once rejection,
-  amount‑mismatch, overdraw; **out‑of‑order** (challenge §13.7) — a `REFUND`
-  before its `BET` **and** a `ROLLBACK` before its `WIN` both park as
-  `PENDING_REFERENCE`, then the worker (manual drain *and* the real scheduled
-  loop) resolves and applies the effect once the reference lands; budget
-  exhausted → `REFERENCE_NOT_FOUND`. **SQS consumer** — happy path + ack,
-  redelivery dedup, crash‑after‑commit replay, business rejection → ack,
-  malformed / unknown wallet / `OPENING` → DLQ with a reason.
+  - **schema constraints & triggers** (§5.9) — the DB itself rejects a negative
+    balance, a duplicate `(playerId, currency)`, a duplicate `idempotency_key`, a
+    `REFUND` with no reference, an unbalanced ledger row, and any `UPDATE` /
+    `DELETE` on the ledger (append-only trigger); migration is reversible.
+  - **outbox** — atomicity, relay publish-once, crash-pending rows, **two
+    concurrent publishers** share the outbox with no loss / no double-publish
+    (§13.6).
+  - **`REFUND` / `ROLLBACK`** — happy paths, reverse-once rejection,
+    amount-mismatch, overdraw; **out-of-order** (§13.7) — a `REFUND` before its
+    `BET` **and** a `ROLLBACK` before its `WIN` both park as `PENDING_REFERENCE`,
+    then the worker (manual drain *and* the real scheduled loop) resolves once the
+    reference lands; budget exhausted → `REFERENCE_NOT_FOUND`.
+  - **SQS consumer** — happy path + ack-after-commit, redelivery dedup,
+    crash-after-commit replay, **transient failure → visibility extended, retried,
+    eventually applied once**, business rejection → ack, malformed / unknown
+    wallet / `OPENING` → DLQ with a `failureClass`.
+  - **Observability** — reconciliation divergence is signalled + logged (delta
+    only) + counted.
   **Observability** — every log line carries the request's `correlationId`
   (+ `walletId` / `transactionId` / `providerId`); a chosen `Money` amount and
   the raw payload never appear in any captured line; `/metrics` increments
@@ -436,7 +488,12 @@ hook a tracing layer would build on.
 - **Concurrency** (`test/concurrency`, real parallelism via `Promise.all`
   against a live HTTP server): the §8 scenario, 50× duplicate, idempotency
   conflict.
-- **Multi‑instance** (`test/multi-instance`, `bun run test:multi-instance`) — see below.
+- **Multi‑instance** (`test/multi-instance`, `bun run test:multi-instance`,
+  spawns real OS processes) — the §13.4 test below, plus **service restart**
+  (`restart.spec.ts`, §13.8): instance 1 commits work with its outbox relay
+  **off**, is `SIGTERM`-ed, instance 2 comes up with the relay **on**, drains the
+  events instance 1 left behind, keeps processing the same wallet, and the final
+  `wallet.balance == ledger` holds.
 
 `wallet.balance == balance rebuilt from the ledger` is asserted in every
 concurrency / multi‑instance case — via `POST /wallets/:id/reconciliation`

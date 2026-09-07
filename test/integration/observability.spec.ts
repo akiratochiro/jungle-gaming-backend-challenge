@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'bun:test';
 import { uuidv7 } from 'uuidv7';
+import { EntityManager } from '@mikro-orm/postgresql';
 import { captureLogs, ensureSchema, startTestApp, TestApp } from '../helpers/test-app';
 import { Client } from '../helpers/client';
 import { Metrics } from '../../src/infra/observability/metrics';
@@ -12,6 +13,7 @@ let client: Client;
 let metrics: Metrics;
 let sqs: SqsClientProvider;
 let consumer: SqsWagerConsumer;
+let em: EntityManager;
 let logs: ReturnType<typeof captureLogs>;
 
 beforeAll(async () => {
@@ -22,6 +24,7 @@ beforeAll(async () => {
   metrics = app.get<Metrics>(Metrics);
   sqs = app.get<SqsClientProvider>(SqsClientProvider);
   consumer = app.get<SqsWagerConsumer>(SqsWagerConsumer);
+  em = app.get<EntityManager>(EntityManager);
 });
 
 afterAll(async () => {
@@ -163,6 +166,32 @@ describe('metrics', () => {
 
     const text = await fetch(`${app.baseUrl}/metrics`).then((r) => r.text());
     expect(metricValue(text, 'sqs_messages_dlq_total', { reason: 'malformed' })).toBe(1);
+  });
+
+  it('a reconciliation divergence is signalled, logged and counted (§9)', async () => {
+    const playerId = PLAYER();
+    const walletId = (await client.createWallet(playerId, '100.00')).body.id;
+    // Corrupt the stored balance directly, bypassing the ledger.
+    await em
+      .getConnection()
+      .execute('UPDATE wallets SET balance_amount = balance_amount + 5 WHERE id = ?', [walletId]);
+
+    const recon = (await fetch(`${app.baseUrl}/wallets/${walletId}/reconciliation`, {
+      method: 'POST',
+    }).then((r) => r.json())) as any;
+    expect(recon.consistent).toBe(false);
+    expect(recon.difference).toEqual({ amount: '5.00', currency: 'BRL' });
+
+    const div = logs.records().find((r) => r.msg === 'wallet reconciliation divergence');
+    expect(div).toBeDefined();
+    expect(div!.walletId).toBe(walletId);
+    expect(div!.differenceAmount).toBe('5.00');
+    // only the residual delta is logged, never the two full balances
+    expect(JSON.stringify(div)).not.toContain('105.00');
+
+    const text = await fetch(`${app.baseUrl}/metrics`).then((r) => r.text());
+    expect(metricValue(text, 'wallet_reconciliation_divergences_total')).toBe(1);
+    expect(metricValue(text, 'wallet_reconciliation_checks_total', { result: 'divergent' })).toBe(1);
   });
 
   it('/metrics is unauthenticated and served as Prometheus text', async () => {

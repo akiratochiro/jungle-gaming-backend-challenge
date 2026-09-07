@@ -7,13 +7,16 @@ transactional outbox.
 
 Design decisions, trade‑offs and current scope live in **[ARCHITECTURE.md](./ARCHITECTURE.md)**.
 
-> **Scope note:** implemented — wallet creation, `BET` / `WIN` / `LOSS`,
-> `REFUND` / `ROLLBACK` with reference resolution, the pending‑reference worker
-> (out‑of‑order), the **SQS consumer** (persistent inbox, ack‑after‑commit, DLQ),
-> hot‑wallet concurrency, idempotency, outbox + relay, ledger, reconciliation,
-> health checks, **JSON logs + Prometheus metrics** (`GET /metrics`). Optional /
-> not done: OpenTelemetry, a dashboard, a load test (see
-> [ARCHITECTURE.md](./ARCHITECTURE.md) §Roadmap).
+> **Scope note — every scored requirement is implemented:** wallet creation,
+> `BET` / `WIN` / `LOSS`, `REFUND` / `ROLLBACK` with reference resolution, the
+> pending‑reference worker (out‑of‑order), the SQS consumer (persistent inbox,
+> ack‑after‑commit, DLQ), hot‑wallet concurrency, idempotency, transactional
+> outbox + relay, immutable ledger, reconciliation, health checks, JSON logs +
+> Prometheus metrics (`GET /metrics`), reversible migrations, and real
+> integration / concurrency / multi‑instance tests.
+> The only optional differentials left undone are the **load test**
+> (`bun run test:load`), OpenTelemetry, a dashboard and double‑entry bookkeeping
+> — all explicitly optional in the brief.
 
 ---
 
@@ -119,11 +122,13 @@ curl -s localhost:3000/metrics
 Structured JSON logs on stdout, one object per line, each carrying the request's
 `correlationId` (plus `walletId` / `transactionId` / `providerId` / `messageId`
 as they become known) — propagated with `AsyncLocalStorage` across HTTP, the SQS
-consumer and the workers. No `Money` values or raw payloads are ever logged.
-`GET /metrics` serves a Prometheus exposition (own lightweight implementation)
-covering transactions by status/kind, idempotency replays, SQS retries + DLQ,
-pending‑reference retries, wallet‑lock wait/contention, outbox lag + backlog, and
-processing latency. Details and the full metric list: **[ARCHITECTURE.md](./ARCHITECTURE.md) §10**.
+consumer and the workers. No `Money` values or raw payloads are ever logged (the
+one deliberate exception is a reconciliation divergence, which logs the residual
+delta). `GET /metrics` serves a Prometheus exposition (own lightweight
+implementation) covering transactions by status/kind, idempotency replays, SQS
+retries + DLQ, pending‑reference retries, wallet‑lock wait/contention, outbox lag
++ backlog, reconciliation divergences, and processing latency. Details and the
+full metric list: **[ARCHITECTURE.md](./ARCHITECTURE.md) §10**.
 
 | Endpoint | |
 |---|---|

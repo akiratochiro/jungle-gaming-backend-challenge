@@ -8,6 +8,7 @@ export interface DbAdmin {
   walletVsLedger(walletId: string): Promise<{ stored: string; rebuilt: string; equal: boolean }>;
   debitCount(walletId: string): Promise<number>;
   betRows(walletId: string): Promise<Array<{ id: string; status: string; failure_code: string | null }>>;
+  pendingOutbox(): Promise<number>;
   close(): Promise<void>;
 }
 
@@ -54,6 +55,13 @@ export async function openDbAdmin(): Promise<DbAdmin> {
         "SELECT id, status, failure_code FROM wager_transactions WHERE wallet_id = ? AND kind = 'BET' ORDER BY created_at",
         [walletId],
       );
+    },
+
+    async pendingOutbox() {
+      const rows = await conn.execute<Array<{ n: number }>>(
+        'SELECT count(*)::int AS n FROM outbox_messages WHERE published_at IS NULL',
+      );
+      return rows[0]?.n ?? 0;
     },
 
     close: () => orm.close(true),

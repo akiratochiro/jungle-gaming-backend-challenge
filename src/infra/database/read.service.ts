@@ -1,9 +1,11 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { EntityManager } from '@mikro-orm/postgresql';
 import { Decimal } from 'decimal.js';
 import { WalletEntity } from './entities/wallet.entity';
 import { WalletLedgerEntryEntity } from './entities/wallet-ledger-entry.entity';
 import { WagerTransactionEntity } from './entities/wager-transaction.entity';
+import { Metrics } from '../observability/metrics';
+import { enrichCorrelation } from '../observability/correlation';
 
 export interface LedgerPage {
   entries: Array<{
@@ -20,7 +22,12 @@ export interface LedgerPage {
 
 @Injectable()
 export class ReadService {
-  constructor(private readonly em: EntityManager) {}
+  private readonly logger = new Logger(ReadService.name);
+
+  constructor(
+    private readonly em: EntityManager,
+    private readonly metrics: Metrics,
+  ) {}
 
   async wallet(walletId: string) {
     const w = await this.em.findOne(WalletEntity, { id: walletId });
@@ -96,6 +103,22 @@ export class ReadService {
     const stored = new Decimal(w.balanceAmount);
     const difference = stored.minus(calculated);
     const consistent = difference.isZero();
+
+    // A divergence is never fixed silently — signalled in the response,
+    // counted in a metric, and logged (challenge §9). Only the residual delta
+    // is logged, never the two full balances.
+    this.metrics.reconciliationChecks.inc({ result: consistent ? 'consistent' : 'divergent' });
+    if (!consistent) {
+      enrichCorrelation({ walletId });
+      this.metrics.reconciliationDivergences.inc();
+      this.logger.warn({
+        msg: 'wallet reconciliation divergence',
+        walletId,
+        currency: w.currency,
+        differenceAmount: difference.toFixed(2),
+        checkedEntries: entries.length,
+      });
+    }
 
     return {
       walletId,

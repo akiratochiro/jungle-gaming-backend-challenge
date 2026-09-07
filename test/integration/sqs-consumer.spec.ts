@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'bun:test';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, spyOn } from 'bun:test';
 import { uuidv7 } from 'uuidv7';
 import { EntityManager } from '@mikro-orm/postgresql';
 import { ensureSchema, startTestApp, TestApp } from '../helpers/test-app';
@@ -174,5 +174,29 @@ describe('SQS consumer', () => {
 
     const dlq = await drainQueue(sqs, sqs.config.dlqUrl);
     expect(dlq).toHaveLength(1);
+  });
+
+  it('a transient failure is retried (visibility extended), not DLQ-ed, and eventually succeeds', async () => {
+    const { walletId, playerId } = await walletWith('100.00');
+    const msg = wagerMessage({ data: { walletId, playerId } }); // money 25.00
+    await enqueue(sqs, msg);
+
+    // first delivery: the use case throws a non-classified (transient) error
+    const spy = spyOn(submit, 'execute').mockRejectedValueOnce(new Error('transient boom'));
+    await consumer.drainOnce();
+    spy.mockRestore();
+
+    // not acked, not on the DLQ, retry counted
+    expect(await drainQueue(sqs, sqs.config.dlqUrl)).toHaveLength(0);
+    const metrics = await fetch(`${app.baseUrl}/metrics`).then((r) => r.text());
+    expect(metrics).toContain('sqs_message_retries_total 1');
+
+    // after the (2s) backoff the message is redelivered and the real use case applies it once
+    await new Promise((r) => setTimeout(r, 2_300));
+    expect(await consumer.drainOnce()).toBe(1);
+
+    const wallet = await client.wallet(walletId);
+    expect(wallet.body.balance.amount).toBe('75.00');
+    expect(await drainQueue(sqs, sqs.config.requestQueueUrl)).toHaveLength(0);
   });
 });

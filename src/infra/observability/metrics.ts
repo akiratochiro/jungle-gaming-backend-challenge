@@ -79,6 +79,19 @@ export class Metrics {
     'Integration events written to the outbox but not yet published',
   );
 
+  /** Reconciliation checks by result. */
+  readonly reconciliationChecks: Counter = this.registry.counter(
+    'wallet_reconciliation_checks_total',
+    'Wallet reconciliation checks by result',
+    ['result'],
+  );
+
+  /** Reconciliation checks that found stored balance ≠ ledger-rebuilt balance. */
+  readonly reconciliationDivergences: Counter = this.registry.counter(
+    'wallet_reconciliation_divergences_total',
+    'Wallet reconciliation checks where the stored balance did not match the ledger',
+  );
+
   render(): Promise<string> {
     return this.registry.render();
   }

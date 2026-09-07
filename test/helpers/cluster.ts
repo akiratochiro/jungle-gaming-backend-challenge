@@ -89,7 +89,10 @@ async function stopInstance(inst: Instance): Promise<void> {
  * Background workers are disabled in the spawned instances so the test isolates
  * the HTTP write path (workers have their own tests).
  */
-export async function startCluster(size = 3): Promise<Cluster> {
+export async function startCluster(
+  size = 3,
+  extraEnv: Record<string, string> = {},
+): Promise<Cluster> {
   const ports = await reservePorts(size);
   const instances: Instance[] = ports.map((port) => {
     const log: string[] = [];
@@ -102,6 +105,7 @@ export async function startCluster(size = 3): Promise<Cluster> {
         SQS_CONSUMER_ENABLED: 'false',
         OUTBOX_RELAY_ENABLED: 'false',
         PENDING_REFERENCE_WORKER_ENABLED: 'false',
+        ...extraEnv,
       },
       stdout: 'pipe',
       stderr: 'pipe',
