@@ -9,9 +9,10 @@ Design decisions, trade‑offs and current scope live in **[ARCHITECTURE.md](./A
 
 > **Scope note:** implemented — wallet creation, `BET` / `WIN` / `LOSS`,
 > `REFUND` / `ROLLBACK` with reference resolution, the pending‑reference worker
-> (out‑of‑order), hot‑wallet concurrency, idempotency, outbox + relay, ledger,
-> reconciliation, health checks. Not yet wired: the SQS consumer, DLQ handling,
-> metrics/JSON logs (see [ARCHITECTURE.md](./ARCHITECTURE.md) §Roadmap).
+> (out‑of‑order), the **SQS consumer** (persistent inbox, ack‑after‑commit, DLQ),
+> hot‑wallet concurrency, idempotency, outbox + relay, ledger, reconciliation,
+> health checks. Not yet wired: metrics / structured‑log formatter, load test
+> (see [ARCHITECTURE.md](./ARCHITECTURE.md) §Roadmap).
 
 ---
 
@@ -49,8 +50,12 @@ docker compose up -d
 # 4. run migrations
 bun run db:up
 
-# 5. start the API (outbox relay runs in-process)
+# 5. start the API (SQS consumer + outbox relay + pending-reference worker run in-process)
 bun run start:dev            # http://localhost:3000
+
+# …or run the API and the workers as separate processes:
+bun run start                # HTTP only  (set SQS_CONSUMER_ENABLED=false etc.)
+bun run worker               # headless: consumer + outbox relay + pending-reference
 ```
 
 Queues created by `scripts/localstack-init.sh`:
@@ -60,8 +65,9 @@ Queues created by `scripts/localstack-init.sh`:
 
 | Command | Description |
 |---|---|
-| `bun run start` | start the HTTP API |
+| `bun run start` | start the HTTP API (+ in-process workers) |
 | `bun run start:dev` | start with watch mode |
+| `bun run worker` | headless workers only (SQS consumer, outbox relay, pending-reference) |
 | `bun run db:up` / `db:down` / `db:fresh` / `db:pending` | migrations |
 | `bun test` | all tests (unit + integration + concurrency) |
 | `bun run test:unit` | domain unit tests only (no I/O) |
@@ -115,10 +121,12 @@ curl -s localhost:3000/health/ready
 ## Project layout
 
 ```
-src/domain/        pure domain — Money, Wallet, WagerTransaction, events
-src/application/   use cases + ports
-src/infra/         MikroORM entities/mappers/UoW, SQS, outbox relay, auth
+src/domain/        pure domain — Money, Wallet, WagerTransaction, reversal, events
+src/application/   use cases + ports (+ ApplicationModule)
+src/infra/         MikroORM entities/mappers/UoW, SQS consumer + client, outbox relay,
+                   pending-reference worker, auth
 src/http/          controllers, DTOs, exception filter
+src/main.ts        HTTP + in-process workers   ·   src/worker.ts   headless workers
 scripts/db.ts      Bun-friendly migration runner
 test/              unit / integration / concurrency
 ```

@@ -1,6 +1,10 @@
 import { Injectable } from '@nestjs/common';
 import {
+  ChangeMessageVisibilityCommand,
+  DeleteMessageCommand,
   GetQueueAttributesCommand,
+  Message,
+  ReceiveMessageCommand,
   SendMessageCommand,
   SQSClient,
 } from '@aws-sdk/client-sqs';
@@ -38,6 +42,7 @@ export class SqsClientProvider {
     body: string;
     groupId: string;
     dedupId: string;
+    attributes?: Record<string, string>;
   }): Promise<void> {
     await this.client.send(
       new SendMessageCommand({
@@ -45,6 +50,50 @@ export class SqsClientProvider {
         MessageBody: params.body,
         MessageGroupId: params.groupId,
         MessageDeduplicationId: params.dedupId,
+        ...(params.attributes
+          ? {
+              MessageAttributes: Object.fromEntries(
+                Object.entries(params.attributes).map(([k, v]) => [
+                  k,
+                  { DataType: 'String', StringValue: v },
+                ]),
+              ),
+            }
+          : {}),
+      }),
+    );
+  }
+
+  async receive(queueUrl: string, max: number, waitSeconds: number, visibilitySeconds: number) {
+    const out = await this.client.send(
+      new ReceiveMessageCommand({
+        QueueUrl: queueUrl,
+        MaxNumberOfMessages: max,
+        WaitTimeSeconds: waitSeconds,
+        VisibilityTimeout: visibilitySeconds,
+        MessageSystemAttributeNames: ['ApproximateReceiveCount'],
+        MessageAttributeNames: ['All'],
+      }),
+    );
+    return (out.Messages ?? []) as Message[];
+  }
+
+  async deleteMessage(queueUrl: string, receiptHandle: string): Promise<void> {
+    await this.client.send(
+      new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: receiptHandle }),
+    );
+  }
+
+  async changeVisibility(
+    queueUrl: string,
+    receiptHandle: string,
+    timeoutSeconds: number,
+  ): Promise<void> {
+    await this.client.send(
+      new ChangeMessageVisibilityCommand({
+        QueueUrl: queueUrl,
+        ReceiptHandle: receiptHandle,
+        VisibilityTimeout: timeoutSeconds,
       }),
     );
   }

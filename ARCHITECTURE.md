@@ -2,11 +2,11 @@
 
 > Status. Implemented end‑to‑end: wallet creation (`OPENING`), `BET` / `WIN` /
 > `LOSS`, `REFUND` / `ROLLBACK` (with reference resolution), the
-> `PENDING_REFERENCE` worker (out‑of‑order references), pessimistic hot‑wallet
-> concurrency, persistent idempotency, transactional outbox + relay, ledger,
-> reconciliation, health checks. **Not yet wired** (documented design below,
-> extension points in place): SQS consumer, DLQ handling, metrics/JSON logs.
-> See *Roadmap*.
+> `PENDING_REFERENCE` worker (out‑of‑order references), the **SQS consumer**
+> (persistent inbox, ack‑after‑commit, DLQ), pessimistic hot‑wallet concurrency,
+> persistent idempotency, transactional outbox + relay, ledger, reconciliation,
+> health checks. **Not yet wired**: metrics / structured‑log formatter, load
+> test. See *Roadmap*.
 
 ---
 
@@ -193,6 +193,50 @@ Budget exhausted → `REJECTED / REFERENCE_NOT_FOUND` + `WagerTransactionRejecte
 Rationale: ~10 attempts over roughly 40 min tolerates realistic out‑of‑order
 windows without parking rows forever.
 
+## 6c. SQS consumer, inbox & DLQ
+
+`SqsWagerConsumer` long‑polls `wager-transactions.fifo` and feeds every message
+through the **same `SubmitWagerTransactionUseCase`** the HTTP endpoint uses
+(`cmd.inbox` set). It is wired in `main.ts` for the API process and in
+`src/worker.ts` for a headless replica; `bun run worker` runs the consumer +
+outbox relay + pending‑reference worker with no HTTP.
+
+**Message** (`type: "WagerTransactionRequested"`) — `parseWagerMessage` does
+structural validation only; domain validation stays in the use case. The
+envelope's own `messageId` (not the SQS `MessageId`) is the inbox key.
+
+**Ack after commit**: the SQS `DeleteMessage` runs only after
+`SubmitWagerTransactionUseCase` returns, i.e. after its SQL transaction
+committed. A crash between commit and delete → redelivery → `claimInbox` finds
+the row → the use case replays the original outcome → the consumer acks. One
+debit, always (test: *crash after commit, before ack*).
+
+**Inbox**: `inbox_messages` PK `(consumer_name, message_id)`. `claimInbox`
+inserts the row **inside the same transaction** as the wallet/ledger/outbox
+writes — so it commits or rolls back with them. An existing row ⟹ a prior
+delivery already committed ⟹ replay.
+
+**Error taxonomy** (challenge §10):
+
+| Class | Examples | Action |
+|---|---|---|
+| business | `REJECTED` (insufficient funds, reference rules) | use case returns normally → **ack** |
+| permanent | malformed body, bad `Money`, unknown wallet, idempotency conflict, `OPENING` via queue | **DLQ** immediately, with `failureReason` / `failedAt` / `sourceQueue` message attributes |
+| transient | deadlock, dropped connection, unknown error | not deleted; `ChangeMessageVisibility` with exponential backoff (`base·2^(n-1)`, cap 900s). After `SQS_MAX_RECEIVE_COUNT` deliveries → **DLQ** |
+
+The queue's own `RedrivePolicy` (`maxReceiveCount` = 5) is a safety net; the
+consumer normally moves to the DLQ explicitly one delivery earlier so it can
+attach the failure reason. Unknown errors default to *transient* — a redeploy
+may fix them — and the receive‑count cap still bounds the retries.
+
+**Graceful shutdown** (`SIGTERM` → `onModuleDestroy`): stop polling, await
+in‑flight handlers (bounded by the visibility timeout). Anything not finished is
+simply never deleted, so SQS makes it visible again — safe because of the inbox.
+
+**FIFO**: a batch is fully awaited before the next poll, so per‑`MessageGroupId`
+ordering is respected; different groups in a batch run concurrently and the
+wallet lock keeps them correct.
+
 ## 7. HTTP status mapping
 
 A provider can branch on the status code alone:
@@ -246,7 +290,9 @@ outbox lag).
   outbox atomicity, relay publish‑once, crash‑pending rows, rejection emits no
   ledger entry; `REFUND`/`ROLLBACK` happy paths, reverse‑once rejection,
   amount‑mismatch, overdraw, and out‑of‑order `PENDING_REFERENCE` → worker
-  resolves / exhausts the budget.
+  resolves / exhausts the budget; **SQS consumer** — happy path + ack, redelivery
+  dedup, crash‑after‑commit replay, business rejection → ack, malformed / unknown
+  wallet / `OPENING` → DLQ with a reason.
 - **Concurrency** (`test/concurrency`, real parallelism via `Promise.all`
   against a live HTTP server): the §8 scenario, 50× duplicate, idempotency
   conflict.
@@ -256,14 +302,10 @@ outbox lag).
 
 ## 12. Roadmap (next slices)
 
-1. **SQS consumer**: `@aws-sdk/client-sqs` long‑poll loop → `claimInbox`
-   (`inbox_messages` PK `(consumer_name, message_id)`, already implemented in the
-   UoW) → **same `SubmitWagerTransactionUseCase`** (it already accepts a
-   `cmd.inbox`) → ack only after commit; business error → ack, transient →
-   visibility timeout, permanent → DLQ after `maxReceiveCount`.
-2. **Metrics + JSON logs**: Prometheus counters (transactions by status,
+1. **Metrics + JSON logs**: Prometheus counters (transactions by status,
    duplicates, retries, DLQ depth, lock waits, outbox lag), a global JSON log
-   formatter.
-3. **Load test** exposed as `bun run test:load`.
-4. Multi‑instance test harness (spawn 3 `bun run src/main.ts` on different
-   ports against one DB) — correctness already holds because the lock is in PG.
+   formatter (context — `correlationId`, `messageId`, `transactionId`,
+   `walletId`, `providerId` — is already threaded through).
+2. **Load test** exposed as `bun run test:load`.
+3. Multi‑instance test harness (spawn 3 `bun run src/main.ts` / `bun run worker`
+   against one DB) — correctness already holds because the lock is in PG.

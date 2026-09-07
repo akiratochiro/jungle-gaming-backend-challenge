@@ -5,6 +5,7 @@ import { AppModule } from './app.module';
 import { DomainExceptionFilter } from './http/domain-exception.filter';
 import { OutboxRelay } from './infra/outbox/outbox-relay';
 import { PendingReferenceWorker } from './infra/workers/pending-reference.worker';
+import { SqsWagerConsumer } from './infra/messaging/sqs-wager-consumer';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bufferLogs: false });
@@ -27,6 +28,9 @@ async function bootstrap() {
   }
   if (process.env.PENDING_REFERENCE_WORKER_ENABLED !== 'false') {
     app.get(PendingReferenceWorker).start();
+  }
+  if (process.env.SQS_CONSUMER_ENABLED !== 'false') {
+    app.get(SqsWagerConsumer).start();
   }
 
   const port = Number(process.env.PORT ?? 3000);
