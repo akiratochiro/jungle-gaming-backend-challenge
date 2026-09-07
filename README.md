@@ -34,7 +34,10 @@ Design decisions, trade‑offs and current scope live in **[ARCHITECTURE.md](./A
 
 ## Prerequisites
 
-- [Bun](https://bun.sh) `>= 1.4` — `curl -fsSL https://bun.sh/install | bash`
+- [Bun](https://bun.sh) `>= 1.4` — `curl -fsSL https://bun.sh/install | bash`.
+  The installer adds `~/.bun/bin` to your shell profile — **open a new terminal
+  (or `source ~/.zshrc` / `~/.bashrc`) so `bun` is on `PATH`**. Every
+  `package.json` script shells out to `bun`, so it must be resolvable.
 - Docker + Docker Compose
 
 ## Setup
@@ -45,21 +48,24 @@ bun install
 
 # 2. environment
 cp .env.example .env
-#   The Postgres host port defaults to 5439 to avoid clashing with a local
-#   Postgres on 5432. Override with DB_HOST_PORT / DATABASE_URL if needed.
+#   Postgres is published on host port 5439 (see DB_HOST_PORT in .env) rather
+#   than 5432, to avoid clashing with a Postgres you may already run locally.
+#   Change DB_HOST_PORT *and* DATABASE_URL's port together if you want another.
 
 # 3. start infrastructure (Postgres + LocalStack, queues auto-created)
-docker compose up -d
+docker compose up -d --wait          # --wait blocks until both are healthy
 
 # 4. run migrations
 bun run db:up
 
-# 5. start the API (SQS consumer + outbox relay + pending-reference worker run in-process)
-bun run start:dev            # http://localhost:3000
+# 5. run the whole service in one process (HTTP + SQS consumer + outbox relay
+#    + pending-reference worker):
+bun run start:dev            # watch mode, http://localhost:3000
+bun run start                # same, without watch
 
-# …or run the API and the workers as separate processes:
-bun run start                # HTTP only  (set SQS_CONSUMER_ENABLED=false etc.)
-bun run worker               # headless: consumer + outbox relay + pending-reference
+# …or split the HTTP API and the workers onto separate processes / replicas:
+bun run start:http           # HTTP only  (WORKERS_ENABLED=false)
+bun run worker               # headless: SQS consumer + outbox relay + pending-reference
 ```
 
 Queues created by `scripts/localstack-init.sh`:
@@ -69,8 +75,8 @@ Queues created by `scripts/localstack-init.sh`:
 
 | Command | Description |
 |---|---|
-| `bun run start` | start the HTTP API (+ in-process workers) |
-| `bun run start:dev` | start with watch mode |
+| `bun run start` / `start:dev` | full service in one process — HTTP **+** all 3 workers (`start:dev` adds watch) |
+| `bun run start:http` | HTTP API only, no workers (`WORKERS_ENABLED=false`) |
 | `bun run worker` | headless workers only (SQS consumer, outbox relay, pending-reference) |
 | `bun run db:up` / `db:down` / `db:fresh` / `db:pending` | migrations |
 | `bun run test` | unit + integration + concurrency (fast inner loop) |
@@ -81,10 +87,18 @@ Queues created by `scripts/localstack-init.sh`:
 | `bun run test:all` | everything, including multi-instance |
 | `bun run lint` | `tsc --noEmit` |
 
-> Integration / concurrency / multi-instance tests need `docker compose up -d`
-> and `bun run db:up` first. They boot real Nest servers and truncate tables
-> between cases. `test:multi-instance` is kept out of the default `bun run test`
-> because it launches 3 OS processes — see [ARCHITECTURE.md](./ARCHITECTURE.md)
+> **Before running any I/O test suite (`test`, `test:integration`,
+> `test:concurrency`, `test:multi-instance`, `test:all`), stop every running API
+> / worker process** — e.g. `pkill -f 'src/main.ts'; pkill -f 'src/worker.ts'`.
+> The tests spin up their own Nest instances against the shared Postgres and
+> LocalStack queues; a leftover in-process **SQS consumer will steal the test
+> messages** and the tests fail non-deterministically. `bun run test:unit` has
+> no I/O and is always safe.
+>
+> The I/O suites also need `docker compose up -d --wait` and `bun run db:up`
+> first; they boot real Nest servers and truncate tables between cases.
+> `test:multi-instance` is kept out of the default `bun run test` because it
+> launches 3 OS processes — see [ARCHITECTURE.md](./ARCHITECTURE.md)
 > §"Multi-instance test".
 
 ## API quick tour
@@ -144,8 +158,13 @@ full metric list: **[ARCHITECTURE.md](./ARCHITECTURE.md) §10**.
 
 ## Background workers
 
-Run in-process with the API (`bun run start`) or as a separate replica
-(`bun run worker`); toggle each with `*_ENABLED=false`.
+By default they run **in-process** with the API (`bun run start` / `start:dev`).
+To scale them out, run the HTTP API with `bun run start:http`
+(`WORKERS_ENABLED=false`) and the workers as one or more `bun run worker`
+replicas. Individual workers can also be toggled with
+`SQS_CONSUMER_ENABLED` / `OUTBOX_RELAY_ENABLED` /
+`PENDING_REFERENCE_WORKER_ENABLED` `=false`. All are safe to run on multiple
+instances (wallet lock + `FOR UPDATE SKIP LOCKED` + inbox).
 
 | Worker | Job |
 |---|---|

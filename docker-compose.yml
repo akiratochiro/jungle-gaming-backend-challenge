@@ -24,10 +24,12 @@ services:
     ports:
       - "4566:4566"
     healthcheck:
-      test: ["CMD-SHELL", "awslocal sqs list-queues || exit 1"]
-      interval: 5s
+      # green only once the init script has created the queues, so
+      # `docker compose up -d --wait` guarantees they exist
+      test: ["CMD-SHELL", "awslocal sqs get-queue-url --queue-name wager-transactions.fifo || exit 1"]
+      interval: 3s
       timeout: 5s
-      retries: 20
+      retries: 30
     volumes:
       - "./scripts/localstack-init.sh:/etc/localstack/init/ready.d/init-queues.sh"
 

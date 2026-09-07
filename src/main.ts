@@ -23,14 +23,16 @@ async function bootstrap() {
   app.enableShutdownHooks();
 
   // Background workers run in-process by default; each is also safe standalone
-  // and safe to run on multiple instances.
-  if (process.env.OUTBOX_RELAY_ENABLED !== 'false') {
+  // and safe to run on multiple instances. `WORKERS_ENABLED=false` turns off all
+  // three at once (HTTP-only mode); the per-worker flags override individually.
+  const workersEnabled = process.env.WORKERS_ENABLED !== 'false';
+  if (workersEnabled && process.env.OUTBOX_RELAY_ENABLED !== 'false') {
     app.get(OutboxRelay).start();
   }
-  if (process.env.PENDING_REFERENCE_WORKER_ENABLED !== 'false') {
+  if (workersEnabled && process.env.PENDING_REFERENCE_WORKER_ENABLED !== 'false') {
     app.get(PendingReferenceWorker).start();
   }
-  if (process.env.SQS_CONSUMER_ENABLED !== 'false') {
+  if (workersEnabled && process.env.SQS_CONSUMER_ENABLED !== 'false') {
     app.get(SqsWagerConsumer).start();
   }
 

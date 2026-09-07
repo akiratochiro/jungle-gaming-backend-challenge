@@ -13,6 +13,13 @@
 > OpenTelemetry traces, a bundled dashboard, and double‑entry bookkeeping — all
 > explicitly optional in the brief. See §12.
 
+**Local ports.** The Compose stack publishes Postgres on host **5439**
+(`DB_HOST_PORT`), not the conventional 5432, purely to avoid a collision with a
+Postgres a reviewer may already run locally; the container still listens on 5432
+internally and `DATABASE_URL` is kept in sync in `.env.example`. The HTTP server
+defaults to `PORT=3000`. Both are plain env vars — nothing in the code assumes a
+specific port.
+
 ---
 
 ## 1. Layering
