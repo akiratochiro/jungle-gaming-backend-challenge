@@ -39,14 +39,19 @@ export class ResolvePendingReferenceUseCase {
 
   execute(cmd: ResolvePendingReferenceCommand): Promise<ResolvePendingReferenceResult> {
     return this.uow.runForWallet(cmd.walletId, async (ctx) => {
+      // Re-read under the wallet lock: another worker on another instance may
+      // have already resolved or rescheduled this row between the scan and here.
       const tx = await ctx.findById(cmd.transactionId);
       if (!tx || tx.status !== WagerTransactionStatus.PendingReference) {
         return { outcome: 'noop' };
       }
+      const now = new Date();
+      if (tx.nextReferenceAttemptAt && tx.nextReferenceAttemptAt.getTime() > now.getTime()) {
+        return { outcome: 'noop' }; // not due yet — a concurrent worker got here first
+      }
       const wallet = ctx.wallet;
       if (!wallet) return { outcome: 'noop' };
 
-      const now = new Date();
       const eventCtx = { correlationId: uuidv7(), causationId: tx.id };
       const events: IntegrationEvent<unknown>[] = [];
 

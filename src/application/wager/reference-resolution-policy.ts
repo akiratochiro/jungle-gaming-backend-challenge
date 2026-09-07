@@ -6,8 +6,10 @@ import { Injectable } from '@nestjs/common';
  * attempt, capped at `capDelayMs`; after `maxAttempts` unsuccessful attempts the
  * transaction is REJECTED with REFERENCE_NOT_FOUND.
  *
- * Defaults: 10 attempts, 2s → 5min cap ≈ up to ~40min of out-of-order tolerance.
- * Justified in ARCHITECTURE.md §Pending reference.
+ * Defaults: base 2s, cap 5min, 10 attempts → gaps of 0, 2, 4, 8, 16, 32, 64,
+ * 128, 256, 300s, i.e. a reference has ~13.5 min (plus one poll interval of
+ * slack per gap) to arrive before the reversal is rejected. Rationale in
+ * ARCHITECTURE.md §"Pending reference".
  */
 @Injectable()
 export class ReferenceResolutionPolicy {

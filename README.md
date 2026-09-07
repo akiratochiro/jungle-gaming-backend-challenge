@@ -118,6 +118,31 @@ curl -s localhost:3000/health/ready
 | `GET /providers/:providerId/wagering/transactions/:externalId` | by provider ref |
 | `GET /health/live` · `GET /health/ready` | liveness · readiness (no auth) |
 
+## Background workers
+
+Run in-process with the API (`bun run start`) or as a separate replica
+(`bun run worker`); toggle each with `*_ENABLED=false`.
+
+| Worker | Job |
+|---|---|
+| **SQS consumer** | polls `wager-transactions.fifo` → same use case → ack after commit; permanent errors → DLQ, transient → backoff then DLQ |
+| **Outbox relay** | publishes committed integration events to `wager-events.fifo` (`FOR UPDATE SKIP LOCKED`, dedup by event id) |
+| **Pending-reference worker** | retries `REFUND`/`ROLLBACK` whose reference hasn't arrived yet |
+
+### Pending-reference (out-of-order `REFUND` / `ROLLBACK`)
+
+When a `REFUND`/`ROLLBACK` is submitted before the transaction it references,
+it is stored as `PENDING_REFERENCE` (HTTP `202`), not rejected. A scheduled
+worker (`PENDING_REFERENCE_POLL_INTERVAL_MS`, default 5s) retries resolution by
+`(providerId, referenceExternalTransactionId)` under the wallet lock, reusing the
+same reversal logic as the sync path. Backoff is exponential
+(`0, 2, 4, 8, … , 300s`, i.e. **≈ 13.5 min** total) over `maxAttempts` (10)
+tries; then the transaction becomes `REJECTED` with `failureCode:
+REFERENCE_NOT_FOUND` and a `WagerTransactionRejected` event — all in one SQL
+transaction. Values and the rationale for ~14 min are in
+[ARCHITECTURE.md](./ARCHITECTURE.md) §"Pending reference"; every knob is
+env-overridable (`PENDING_REFERENCE_*`).
+
 ## Project layout
 
 ```

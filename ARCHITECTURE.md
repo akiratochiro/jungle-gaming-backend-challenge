@@ -180,18 +180,59 @@ path and the pending‑reference worker.
 
 ### Pending reference (out‑of‑order, §7.1)
 
-If the reference is not found, the transaction is persisted as
-`PENDING_REFERENCE` (HTTP `202`) with `WagerTransactionPendingReference` emitted.
-`PendingReferenceWorker` scans
-`status='PENDING_REFERENCE' AND next_attempt_at <= now()` (partial index),
-`LIMIT n`, and re‑runs `ResolvePendingReferenceUseCase` per row **under the
-wallet lock** — a stale pick is a no‑op, so it is multi‑instance safe.
+`REFUND`/`ROLLBACK` may arrive before the transaction they reference. When
+resolution by `(providerId, referenceExternalTransactionId)` finds nothing, the
+reversal is **not rejected** — it is persisted as `PENDING_REFERENCE` (HTTP
+`202`), `WagerTransactionPendingReference` goes to the outbox, and a background
+worker keeps retrying.
 
-`ReferenceResolutionPolicy`: first retry immediate, then exponential backoff from
-`baseDelayMs` (2s) capped at `capDelayMs` (5min), up to `maxAttempts` (10).
-Budget exhausted → `REJECTED / REFERENCE_NOT_FOUND` + `WagerTransactionRejected`.
-Rationale: ~10 attempts over roughly 40 min tolerates realistic out‑of‑order
-windows without parking rows forever.
+**Worker** — `PendingReferenceWorker`, started by `main.ts` and by
+`src/worker.ts` (headless). Every `PENDING_REFERENCE_POLL_INTERVAL_MS` (5s) it
+scans
+
+```sql
+SELECT id, wallet_id FROM wager_transactions
+WHERE status = 'PENDING_REFERENCE'
+  AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+ORDER BY created_at ASC LIMIT n
+```
+
+(served by the partial index `(status, next_attempt_at) WHERE
+status='PENDING_REFERENCE'`) and runs `ResolvePendingReferenceUseCase` per row
+**inside that row's wallet lock**. That use case re‑reads the row under the lock
+and bails out (`noop`) if another instance already moved it or pushed its
+`next_attempt_at` into the future — so running the worker on several instances is
+safe without any distributed lock. Resolution reuses `ApplyReversalService`, so
+the REFUND/ROLLBACK rules (§6b) are applied identically to the synchronous path;
+the ledger entry, wallet update and the `WagerTransactionProcessed` /
+`WalletBalanceChanged` (or `WagerTransactionRejected`) events all commit in the
+**same SQL transaction**. A mere reschedule emits no event.
+
+**Backoff & budget** — `ReferenceResolutionPolicy` (all env‑overridable):
+
+| param | default | |
+|---|---|---|
+| `baseDelayMs` | `2000` | first backoff |
+| `capDelayMs` | `300000` | max backoff |
+| `maxAttempts` | `10` | attempts before giving up |
+
+First look is immediate; then the gap before attempt *n* is
+`min(base·2^(n-2), cap)` → `0, 2, 4, 8, 16, 32, 64, 128, 256, 300` seconds.
+**A reference therefore has ≈ 13.5 minutes** (plus up to one 5s poll interval of
+slack per gap, so ~14–15 min wall‑clock) to show up.
+
+*Why an attempt count and not a wall‑clock TTL, and why ~14 min:* out‑of‑order
+delivery on a FIFO queue comes from redelivery after a visibility timeout or a
+lagging consumer — seconds to a couple of minutes. 14 minutes clears that with a
+wide margin while the exponential curve keeps the worker cheap (a stuck row is
+polled ~10 times total, not every 5s forever). A provider whose reference is
+genuinely delayed longer than that gets a clear, machine‑readable
+`REFERENCE_NOT_FOUND` and can resubmit — which is safer than holding money
+movements pending indefinitely.
+
+**Budget exhausted** → `reject(REFERENCE_NOT_FOUND)` +
+`WagerTransactionRejected` on the outbox, in one transaction. `PROCESSED` /
+`REJECTED` are terminal, so the row is never scanned again.
 
 ## 6c. SQS consumer, inbox & DLQ
 
@@ -289,10 +330,14 @@ outbox lag).
 - **Integration** (`test/integration`, real PostgreSQL + real LocalStack SQS):
   outbox atomicity, relay publish‑once, crash‑pending rows, rejection emits no
   ledger entry; `REFUND`/`ROLLBACK` happy paths, reverse‑once rejection,
-  amount‑mismatch, overdraw, and out‑of‑order `PENDING_REFERENCE` → worker
-  resolves / exhausts the budget; **SQS consumer** — happy path + ack, redelivery
-  dedup, crash‑after‑commit replay, business rejection → ack, malformed / unknown
-  wallet / `OPENING` → DLQ with a reason.
+  amount‑mismatch, overdraw; **out‑of‑order** (challenge §13.7) — a `REFUND`
+  before its `BET` **and** a `ROLLBACK` before its `WIN` both park as
+  `PENDING_REFERENCE`, then the worker (manual drain *and* the real scheduled
+  loop) resolves and applies the effect once the reference lands; budget
+  exhausted → `REFERENCE_NOT_FOUND`. **SQS consumer** — happy path + ack,
+  redelivery dedup, crash‑after‑commit replay, business rejection → ack,
+  malformed / unknown wallet / `OPENING` → DLQ with a reason.
+- **Policy** (`bun test src`): the backoff schedule and the ~13.5 min window.
 - **Concurrency** (`test/concurrency`, real parallelism via `Promise.all`
   against a live HTTP server): the §8 scenario, 50× duplicate, idempotency
   conflict.

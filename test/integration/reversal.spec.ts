@@ -1,21 +1,28 @@
-// Compress the reference-resolution backoff so the worker retries quickly.
-process.env.PENDING_REFERENCE_BASE_DELAY_MS = '1';
-process.env.PENDING_REFERENCE_CAP_DELAY_MS = '5';
-process.env.PENDING_REFERENCE_MAX_ATTEMPTS = '3';
-
-const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'bun:test';
 import { uuidv7 } from 'uuidv7';
 import { ensureSchema, startTestApp, TestApp } from '../helpers/test-app';
 import { Client, op } from '../helpers/client';
 import { PendingReferenceWorker } from '../../src/infra/workers/pending-reference.worker';
 
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Compress the reference-resolution backoff so the worker retries quickly.
+const ENV_OVERRIDES = {
+  PENDING_REFERENCE_BASE_DELAY_MS: '1',
+  PENDING_REFERENCE_CAP_DELAY_MS: '5',
+  PENDING_REFERENCE_MAX_ATTEMPTS: '3',
+} as const;
+const savedEnv: Record<string, string | undefined> = {};
+
 let app: TestApp;
 let client: Client;
 let worker: PendingReferenceWorker;
 
 beforeAll(async () => {
+  for (const [k, v] of Object.entries(ENV_OVERRIDES)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
   await ensureSchema();
   app = await startTestApp();
   client = new Client(app.baseUrl);
@@ -24,6 +31,10 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await app.close();
+  for (const k of Object.keys(ENV_OVERRIDES)) {
+    if (savedEnv[k] === undefined) delete process.env[k];
+    else process.env[k] = savedEnv[k];
+  }
 });
 
 beforeEach(async () => {
@@ -203,6 +214,95 @@ describe('out-of-order reference (PENDING_REFERENCE)', () => {
 
     const recon = await client.reconcile(walletId);
     expect(recon.body.consistent).toBe(true);
+  });
+
+  it('parks a ROLLBACK that arrives before its WIN, then the worker applies the inverse', async () => {
+    const { walletId, playerId } = await walletWith('100.00');
+    const winExt = uuidv7();
+
+    const rollback = await client.submit(
+      op('ROLLBACK', {
+        walletId,
+        playerId,
+        roundId: 'round-7',
+        referenceExternalTransactionId: winExt,
+        money: { amount: '40.00', currency: 'BRL' },
+      }),
+    );
+    expect(rollback.status).toBe(202);
+    expect(rollback.body.status).toBe('PENDING_REFERENCE');
+    expect((await client.wallet(walletId)).body.balance.amount).toBe('100.00'); // untouched
+
+    await worker.drainOnce(); // reference still absent -> reschedule
+
+    // the WIN lands afterwards
+    await client.submit(
+      op('WIN', {
+        walletId,
+        playerId,
+        roundId: 'round-7',
+        externalTransactionId: winExt,
+        money: { amount: '40.00', currency: 'BRL' },
+      }),
+    );
+    expect((await client.wallet(walletId)).body.balance.amount).toBe('140.00');
+
+    await wait(10);
+    expect(await worker.drainOnce()).toBe(1);
+
+    const resolved = await fetch(
+      `${app.baseUrl}/wagering/transactions/${rollback.body.transactionId}`,
+    ).then((r) => r.json() as any);
+    expect(resolved.status).toBe('PROCESSED');
+
+    // ROLLBACK inverts the WIN credit -> debit 40
+    expect((await client.wallet(walletId)).body.balance.amount).toBe('100.00');
+    const ledger = await client.ledger(walletId);
+    const debits = ledger.body.entries.filter((e: any) => e.direction === 'DEBIT');
+    expect(debits).toHaveLength(1);
+    expect((await client.reconcile(walletId)).body.consistent).toBe(true);
+  });
+
+  it('the scheduled worker loop (not a manual drain) resolves a parked reversal', async () => {
+    const { walletId, playerId } = await walletWith('100.00');
+    const betExt = uuidv7();
+
+    const refund = await client.submit(
+      op('REFUND', {
+        walletId,
+        playerId,
+        roundId: 'round-loop',
+        referenceExternalTransactionId: betExt,
+        money: { amount: '20.00', currency: 'BRL' },
+      }),
+    );
+    expect(refund.body.status).toBe('PENDING_REFERENCE');
+
+    worker.start(20); // real setInterval-style loop
+    try {
+      await client.submit(
+        op('BET', {
+          walletId,
+          playerId,
+          roundId: 'round-loop',
+          externalTransactionId: betExt,
+          money: { amount: '20.00', currency: 'BRL' },
+        }),
+      );
+
+      // poll until the loop picks it up
+      let status = 'PENDING_REFERENCE';
+      for (let i = 0; i < 100 && status !== 'PROCESSED'; i++) {
+        await wait(20);
+        status = await fetch(`${app.baseUrl}/wagering/transactions/${refund.body.transactionId}`)
+          .then((r) => r.json() as any)
+          .then((b) => b.status);
+      }
+      expect(status).toBe('PROCESSED');
+      expect((await client.wallet(walletId)).body.balance.amount).toBe('100.00');
+    } finally {
+      worker.stop();
+    }
   });
 
   it('rejects with REFERENCE_NOT_FOUND after the retry budget is exhausted', async () => {

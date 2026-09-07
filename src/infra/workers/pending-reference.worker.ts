@@ -22,6 +22,8 @@ export class PendingReferenceWorker implements OnModuleDestroy {
   ) {}
 
   start(intervalMs = Number(process.env.PENDING_REFERENCE_POLL_INTERVAL_MS ?? 5000)): void {
+    if (this.timer) return;
+    this.stopped = false;
     const tick = async () => {
       if (this.stopped) return;
       try {
@@ -34,9 +36,14 @@ export class PendingReferenceWorker implements OnModuleDestroy {
     this.timer = setTimeout(tick, intervalMs);
   }
 
-  onModuleDestroy(): void {
+  stop(): void {
     this.stopped = true;
     if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+  }
+
+  onModuleDestroy(): void {
+    this.stop();
   }
 
   /** Processes one batch of due transactions. Returns how many were touched. */
